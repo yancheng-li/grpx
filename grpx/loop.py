@@ -1,0 +1,516 @@
+import dataclasses
+import json
+import pathlib
+import random
+import time
+import warnings
+
+import torch
+
+from grpx.rollout import rollout_groups
+from grpx.trainer import (
+    action_log_probabilities,
+    build_batch,
+    grpo_loss,
+    merged_trajectory_fraction,
+    prepare_update_units,
+)
+from grpx.advantage import compute_advantages
+from grpx.logging import format_record, create_run_directory
+from grpx.evaluation import evaluate
+from grpx.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint, truncate_metrics
+from grpx.types import mean_environment_metrics, success_fraction
+from grpx.trajectory_logging import (
+    append_trajectory_samples,
+    select_trajectory_samples,
+    summarize_answer_lengths,
+    truncate_trajectory_samples,
+)
+from grpx.config import ALGORITHM_PRESETS, TrainingConfig    # noqa: F401  兼容旧的导入路径
+from grpx.device import indexed_cuda_device, is_cuda_device
+from grpx.learning_rate import make_learning_rate_lambda
+
+TRAJECTORY_SAMPLES_PER_CLASS = 2
+
+# 兼容旧导入；真正上限以 TrainingConfig.memory_fraction 为准（默认同此值）
+TRAINING_MEMORY_FRACTION = 0.6
+SHARED_GPU_MEMORY_FRACTION_HINT = 0.9
+
+
+def should_measure_shift(iteration, interval):
+    """与评测间隔同一写法：interval>0 且 iteration 整除时测；第 0 轮总会测。"""
+    return interval > 0 and iteration % interval == 0
+
+
+def loss_options(config):
+    return {
+        "clip_range": config.clip_range,
+        "length_normalization": config.length_normalization,
+        "constant_length": config.constant_length,
+    }
+
+def collect_trajectories(
+    backend, tokenizer, environment_factory, samples, config, iteration
+):
+    return rollout_groups(
+        backend, tokenizer, environment_factory,
+        [(f"iteration-{iteration}-group-{group_index}", sample, iteration * 100003 + group_index)
+         for group_index, sample in enumerate(samples)],
+        group_size=config.group_size,
+        policy_version=iteration,
+        max_steps=config.max_steps,
+        truncated_reward=config.truncated_reward,
+    )
+
+# 第 0 轮 LoRA 增量近零，中位数应只差精度（千分之几）；超过此值视为训推不是同一模型
+BACKEND_LOGPROB_GAP_MEDIAN_LIMIT = 0.05
+
+
+def measure_backend_log_probability_gap(batches, old_log_probabilities):
+    """用更新前算出的旧策略对数概率，与同位置的服务端采样对数概率对比。
+
+    不另做前向：old_log_probabilities 已是采样时刻训练端权重下的值。
+    只覆盖有信号且带服务端概率的位置（本地后端、补上的结束符会被 mask 掉）。
+    多推理地址时按地址分别统计，主指标取各地址最大值。
+    """
+    gaps_by_url = {}
+    for batch, old in zip(batches, old_log_probabilities):
+        comparable = batch["sampling_log_probability_mask"][:, 1:]
+        if not comparable.any():
+            continue
+        difference = (old - batch["sampling_log_probabilities"][:, 1:]).abs()
+        urls = batch.get("backend_urls")
+        row_count = comparable.shape[0]
+        for row_index in range(row_count):
+            row_mask = comparable[row_index]
+            if not row_mask.any():
+                continue
+            url = ""
+            if urls is not None and row_index < len(urls) and urls[row_index]:
+                url = urls[row_index]
+            gaps_by_url.setdefault(url, []).append(difference[row_index][row_mask])
+    if not gaps_by_url:
+        return {}
+    medians = {}
+    percentiles = {}
+    for url, pieces in gaps_by_url.items():
+        gap = torch.cat(pieces).float()
+        medians[url] = gap.median().item()
+        percentiles[url] = torch.quantile(gap, 0.95).item()
+    worst_url = max(medians, key=medians.get)
+    metrics = {
+        "backend_log_probability_gap_median": medians[worst_url],
+        "backend_log_probability_gap_p95": max(percentiles.values()),
+        "gap_by_url": medians,
+    }
+    if len(medians) > 1:
+        metrics["backend_log_probability_gap_worst_url"] = worst_url or "(unknown)"
+    return metrics
+
+
+def enforce_backend_log_probability_gap(gap_metrics, *, hard=False,
+                                        limit=BACKEND_LOGPROB_GAP_MEDIAN_LIMIT):
+    """进程启动后第一次有 gap 指标时硬检查；之后的轮次只警告。
+
+    hard=True 用于本进程首次核对（含 --resume），与 iteration 编号无关。
+    """
+    median = gap_metrics.get("backend_log_probability_gap_median")
+    if median is None or median <= limit:
+        return
+    message = (
+        f"backend_log_probability_gap_median={median:.3f} 超过 {limit}；"
+        "训练端和推理服务不是同一个模型（或分词器 / 对话模板不一致）。"
+        "请确认 vLLM 加载的基座与 [model].name 相同，"
+        "或用 [backend].server_model_name 声明服务端名字。"
+    )
+    by_url = gap_metrics.get("gap_by_url") or {}
+    if len(by_url) > 1:
+        detail = "、".join(
+            f"{(url or '(unknown)')}={value:.3f}" for url, value in sorted(by_url.items()))
+        message += f" 各地址中位数：{detail}。"
+        worst = gap_metrics.get("backend_log_probability_gap_worst_url")
+        if worst:
+            message += f" 最差地址：{worst}。"
+    if hard:
+        raise RuntimeError(message)
+    warnings.warn(message, stacklevel=2)
+
+
+def public_gap_metrics(gap_metrics):
+    """写入 metrics.jsonl / 终端的字段；去掉仅供报错用的 gap_by_url。"""
+    return {key: value for key, value in gap_metrics.items() if key != "gap_by_url"}
+
+
+def summarize_rollout(trajectories, kept):
+    total_rewards = [trajectory.total_reward for trajectory in trajectories]
+    successes = success_fraction(trajectories)
+    return {
+        "mean_reward": sum(total_rewards) / len(total_rewards),
+        **({"success_fraction": successes} if successes is not None else {}),
+        "signal_fraction": len(kept) / len(trajectories),
+        "length_limit_fraction": sum(
+            trajectory.termination_reason == "length_limit" 
+            for trajectory in trajectories) / len(trajectories),
+        "mean_step_count": sum(len(trajectory.steps) for trajectory in trajectories) / len(trajectories),
+        "step_limit_fraction": sum(
+            trajectory.termination_reason == "step_limit"
+            for trajectory in trajectories) / len(trajectories),
+        **summarize_answer_lengths(trajectories),
+        **mean_environment_metrics(trajectories),
+    }
+
+def row_length(row):
+    last = row.steps[-1]
+    return len(last.prompt_token_ids) + len(last.action_token_ids)
+
+def segment_count(row):
+    """小批预算按段（步）计，合并后一行多段仍占相应步数。"""
+    return len(row.steps)
+
+def batch_segment_weight(batch):
+    weights = batch.get("segment_weights", batch["row_weights"])
+    return weights.sum().item()
+
+def split_into_row_chunks(trajectories, max_rows, max_tokens, merge_append_only=False):
+    """按更新单元切小批：默认每步一行；merge_append_only 时追加式轨迹合并为一行。
+    max_rows 限制的是段数（步数），不是合并后的物理行数；另限制 行数 × 补齐后长度。
+
+    单行已超过 max_tokens 的对话无法安全更新（单独成批也会顶满甚至 OOM），
+    在组批前丢掉并每轮汇总一条警告，避免训练整体崩溃。
+    """
+    rows = prepare_update_units(trajectories, merge_append_only=merge_append_only)
+    # 按长度降序排列，长度相近的放在一起，减少补齐浪费；每批的第一行就是该批最长的
+    rows.sort(key=row_length, reverse=True)
+    dropped_lengths = [row_length(row) for row in rows if row_length(row) > max_tokens]
+    if dropped_lengths:
+        total = len(rows)
+        fraction = len(dropped_lengths) / total
+        percent = 100.0 * fraction
+        base = (
+            f"本轮有 {len(dropped_lengths)} 行超过 max_tokens_per_minibatch={max_tokens}"
+            f"（最长 {max(dropped_lengths)}，占 {percent:.0f}%），已跳过不参与更新；"
+            f"对话历史可能过长"
+        )
+        # 比例高时升级措辞，避免当成普通噪声略过（与预检 5%/20% 阈值一致）
+        if fraction > 0.20:
+            warnings.warn(
+                f"严重：{base}。超过两成更新单元被丢掉，本轮几乎没在学；"
+                f"请增大 max_tokens_per_minibatch",
+                UserWarning,
+            )
+        elif fraction > 0.05:
+            warnings.warn(
+                f"注意：{base}。超过 5% 的更新单元被丢掉；建议增大 max_tokens_per_minibatch",
+                UserWarning,
+            )
+        else:
+            warnings.warn(base)
+    rows = [row for row in rows if row_length(row) <= max_tokens]
+    chunks, current = [], []
+    current_segments = 0
+    for row in rows:
+        segments = segment_count(row)
+        if current and (
+                current_segments + segments > max_rows
+                or (len(current) + 1) * row_length(current[0]) > max_tokens):
+            chunks.append(current)
+            current = []
+            current_segments = 0
+        current.append(row)
+        current_segments += segments
+    if current:
+        chunks.append(current)
+    return chunks
+
+def _batch_shape(batch):
+    return {
+        "rows": int(batch["input_token_ids"].shape[0]),
+        "length": int(batch["input_token_ids"].shape[1]),
+        "segments": int(batch["segment_advantages"].shape[0]) if "segment_advantages" in batch
+        else int(batch["advantages"].shape[0]),
+    }
+
+def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tracker=None):
+    """各小批的损失按段权重之和的占比加权后累积梯度，结果等于全体段一次算出的梯度；返回按同样权重平均的指标"""
+    total_weight = sum(batch_segment_weight(batch) for batch in batches)
+    weighted_metrics = []
+    for batch, old_log_probability in zip(batches, old_log_probabilities):
+        new_log_probability, mask = action_log_probabilities(model, batch)
+        loss, metrics = grpo_loss(
+            new_log_probability, old_log_probability, mask, batch["advantages"],
+            row_weights=batch["row_weights"],
+            segment_ids=batch.get("segment_ids"),
+            segment_advantages=batch.get("segment_advantages"),
+            segment_weights=batch.get("segment_weights"),
+            **loss_options(config)
+        )
+        weight = batch_segment_weight(batch) / total_weight
+        (loss * weight).backward()
+        if peak_tracker is not None:
+            peak_tracker.note(batch, "backward")
+        weighted_metrics.append((weight, metrics))
+    # max_ 开头的取各批最大值，加权平均会把单个小批的大偏差稀释掉；
+    # 中位数和分位数按批加权平均并不是真正的全局分位数，单次更新时它们恒为零，只看 measure_policy_shift 的
+    return {
+        name: (max(metrics[name] for _, metrics in weighted_metrics) if name.startswith("max_")
+               else sum(weight * metrics[name] for weight, metrics in weighted_metrics))
+        for name in weighted_metrics[0][1]
+    }
+
+class _PeakBatchTracker:
+    """记录全局峰值上扬时所在小批的形状；不 reset，以免干扰外层峰值统计。"""
+
+    def __init__(self, device=None):
+        self.best = None
+        self._peak_bytes = -1
+        self.device = device
+
+    def note(self, batch, phase):
+        device = indexed_cuda_device(self.device) if self.device is not None else None
+        if device is None or not torch.cuda.is_available():
+            return
+        torch.cuda.synchronize(device)
+        peak_bytes = torch.cuda.max_memory_allocated(device)
+        if peak_bytes > self._peak_bytes:
+            self._peak_bytes = peak_bytes
+            self.best = {**_batch_shape(batch), "phase": phase,
+                         "peak_gigabytes": peak_bytes / 2 ** 30}
+
+def update_policy(model, optimizer, kept, padding_token_id, config):
+    units = prepare_update_units(kept, merge_append_only=config.merge_append_only_turns)
+    merge_fraction = merged_trajectory_fraction(kept, units)
+    oversized_lengths = [
+        row_length(unit) for unit in units
+        if row_length(unit) > config.max_tokens_per_minibatch
+    ]
+    oversized_stats = {
+        "oversized_row_count": len(oversized_lengths),
+        "oversized_row_max_length": max(oversized_lengths) if oversized_lengths else 0,
+    }
+    chunks = split_into_row_chunks(
+        kept, config.max_rows_per_minibatch, config.max_tokens_per_minibatch,
+        merge_append_only=config.merge_append_only_turns)
+    if not chunks:
+        # 全部超长被筛掉：跳过更新，让训练继续
+        return [], [], [], {}, merge_fraction, None, oversized_stats
+    batches = [
+        build_batch(chunk, padding_token_id, model.device, config.row_weighting)
+        for chunk in chunks
+    ]
+
+    peak_tracker = _PeakBatchTracker(device=getattr(config, "device", None) or model.device)
+    model.eval()
+    with torch.no_grad():         # 更新前，把所有小批的旧概率算出来
+        old_log_probabilities = []
+        for batch in batches:
+            old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+            peak_tracker.note(batch, "old_log_probs")
+    gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
+
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+
+    history = []
+    for _ in range(config.updates_per_iteration):
+        model.train()
+        optimizer.zero_grad()
+        averaged = accumulate_gradients(
+            model, batches, old_log_probabilities, config, peak_tracker=peak_tracker)
+        history.append(averaged)
+        if (config.max_approximate_kl is not None
+                and averaged["approximate_kl"] > config.max_approximate_kl):
+            break
+        torch.nn.utils.clip_grad_norm_(trainable_params, config.max_gradient_norm)
+        optimizer.step()
+    return (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
+            peak_tracker.best, oversized_stats)
+
+def measure_policy_shift(model, batches, old_log_probabilities, config):
+    """更新之后对所有小批再做一遍无梯度前向，把回答位置的对数比值收集到一起，统一算分位数。
+
+    必须复用 update_policy 里算旧对数概率时的同一批 tensors（切分、顺序、补齐都相同）。
+    另建小批会在 bf16 下引入与学习率无关的路径差，把位移指标打成底噪。"""
+    model.eval()
+    log_ratios = []
+    with torch.no_grad():
+        for batch, old_log_probability in zip(batches, old_log_probabilities, strict=True):
+            new_log_probability, mask = action_log_probabilities(model, batch)
+            log_ratios.append((new_log_probability - old_log_probability)[mask])
+    log_ratio = torch.cat(log_ratios).float()
+    absolute_log_ratio = log_ratio.abs()
+    return {
+        "shift_clip_fraction": ((log_ratio.exp() - 1).abs() > config.clip_range).float().mean().item(),
+        "shift_median_absolute_log_ratio": absolute_log_ratio.median().item(),
+        "shift_percentile_95_absolute_log_ratio": torch.quantile(absolute_log_ratio, 0.95).item(),
+    }
+
+def train(model, tokenizer, backend, dataset, environment_factory, config, evaluation_dataset=None,
+          resolved_configuration=None, resume_from=None, run_directory=None):
+    """resolved_configuration：命令行读入并合并覆盖项后的完整配置，原样存进运行目录以便复现。
+    resume_from：已有运行目录；从其中最新检查点恢复，配置应由调用方从该目录读入。
+    run_directory：调用方已创建好的运行目录（例如 vLLM 需要先建目录再写适配器）。"""
+    if config.length_normalization == "constant" and config.constant_length is None:
+        config = dataclasses.replace(config, constant_length=backend.max_new_tokens)
+    # 输出层分块：挂到模型上，action_log_probabilities 读取
+    model.grpx_output_logit_chunk_size = config.output_logit_chunk_size
+    cuda_device = indexed_cuda_device(config.device)
+    if cuda_device is not None and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(
+            config.memory_fraction, device=cuda_device)
+
+    if resume_from is not None:
+        run_directory = pathlib.Path(resume_from)
+        checkpoint_directory = find_latest_checkpoint(run_directory)
+        if checkpoint_directory is None:
+            raise ValueError(f"{run_directory} 里没有可用的检查点")
+        (run_directory / "config.json").write_text(
+            json.dumps(dataclasses.asdict(config), indent=2, ensure_ascii=False), encoding="utf-8")
+    elif run_directory is None:
+        run_directory = create_run_directory(config)
+        checkpoint_directory = None
+    else:
+        run_directory = pathlib.Path(run_directory)
+        checkpoint_directory = None
+
+    if hasattr(backend, "adapter_directory"):
+        backend.adapter_directory = run_directory / "vllm_adapter"
+
+    if resolved_configuration is not None:
+        (run_directory / "resolved_configuration.json").write_text(
+            json.dumps(resolved_configuration, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    random_generator = random.Random(config.seed)
+    torch.manual_seed(config.seed)    # 恢复时随后被检查点里的随机状态覆盖
+    trainable_params = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    # 衰减长度开跑时钉死；恢复时若检查点里有记录则沿用，延长 iterations 不会把学习率抬回去
+    schedule_horizon = config.iterations
+    optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, make_learning_rate_lambda(config, schedule_horizon)
+    )
+    padding_token_id = tokenizer.pad_token_id
+    if padding_token_id is None:
+        padding_token_id = min(backend.end_token_ids)
+
+    start_iteration = 0
+    if checkpoint_directory is not None:
+        start_iteration, saved_horizon = load_checkpoint(
+            checkpoint_directory, model, optimizer, scheduler, random_generator,
+            device=config.device)
+        if saved_horizon is not None:
+            schedule_horizon = saved_horizon
+            # 用钉死的 horizon 重建 lambda；last_epoch / _last_lr 已由 load_state_dict 恢复
+            scheduler.lr_lambdas = [make_learning_rate_lambda(config, schedule_horizon)]
+        if start_iteration >= config.iterations:
+            # 已完成且未延长：不动日志，保留最终评测那一条
+            print(f"从 {checkpoint_directory.name} 恢复，已完成 {start_iteration} 轮；"
+                  "这次运行已经完成。要继续训练，请用 --set training.iterations=<更大的值>")
+            return run_directory
+        dropped = truncate_metrics(run_directory / "metrics.jsonl", start_iteration)
+        dropped_samples = truncate_trajectory_samples(
+            run_directory / "trajectory_samples.jsonl", start_iteration)
+        print(f"从 {checkpoint_directory.name} 恢复，已完成 {start_iteration} 轮，"
+              f"丢弃其后的 {dropped} 条日志"
+              + (f"、{dropped_samples} 条轨迹抽样" if dropped_samples else ""))
+
+    # 恢复后与首次采样前合并为一次：评测/采样都看到当前权重
+    backend.synchronize_policy(model)
+    # 本进程第一次拿到 gap 指标时硬检查（resume 的「第一轮」也算）
+    gap_hard_check_pending = True
+
+    with open(run_directory / "metrics.jsonl", "a", encoding="utf-8", buffering=1) as log_file:
+        for iteration in range(start_iteration, config.iterations):
+            iteration_start_time = time.perf_counter()
+            if cuda_device is not None and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(cuda_device)
+            record = {"iteration": iteration, "learning_rate": scheduler.get_last_lr()[0]}
+            # 评测放在本轮更新之前：第 0 轮得到的就是未训练的基线
+            evaluation_seconds = 0.0
+            if evaluation_dataset and iteration % config.evaluation_interval == 0:
+                phase_start = time.perf_counter()
+                record.update(evaluate(backend, tokenizer, environment_factory,
+                                       evaluation_dataset, config.max_steps,
+                                       truncated_reward=config.truncated_reward))
+                evaluation_seconds = time.perf_counter() - phase_start
+            samples = random_generator.sample(dataset, config.groups_per_iteration)
+            phase_start = time.perf_counter()
+            trajectories = collect_trajectories(
+                backend, tokenizer, environment_factory, samples, config, iteration
+                )
+            sampling_seconds = time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+            diagnostics = {}
+            kept = compute_advantages(trajectories, normalize_std=config.normalize_std,
+                                      step_advantage_weight=config.step_advantage_weight,
+                                      discount_factor=config.discount, diagnostics=diagnostics)
+            record.update(summarize_rollout(trajectories, kept))
+            record.update(diagnostics)
+            append_trajectory_samples(
+                run_directory / "trajectory_samples.jsonl",
+                iteration,
+                select_trajectory_samples(
+                    trajectories, tokenizer, TRAJECTORY_SAMPLES_PER_CLASS),
+            )
+            metrics_seconds = time.perf_counter() - phase_start
+            update_seconds = 0.0
+            shift_seconds = 0.0
+            synchronize_seconds = 0.0
+            if kept:
+                phase_start = time.perf_counter()
+                (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
+                 _peak_batch, oversized_stats) = update_policy(
+                    model, optimizer, kept, padding_token_id, config
+                )
+                record.update(oversized_stats)
+                record["merged_trajectory_fraction"] = merge_fraction
+                if history:
+                    record["loss"] = history[-1]["loss"]
+                    record.update(public_gap_metrics(gap_metrics))
+                    enforce_backend_log_probability_gap(
+                        gap_metrics, hard=gap_hard_check_pending)
+                    gap_hard_check_pending = False
+                    if should_measure_shift(iteration, config.shift_measurement_interval):
+                        shift_start = time.perf_counter()
+                        record.update(measure_policy_shift(
+                            model, batches, old_log_probabilities, config))
+                        shift_seconds = time.perf_counter() - shift_start
+                    scheduler.step()
+                    # 位移前向从 update_seconds 拆出，便于不同间隔之间比较更新耗时
+                    update_seconds = time.perf_counter() - phase_start - shift_seconds
+                    phase_start = time.perf_counter()
+                    backend.synchronize_policy(model)
+                    synchronize_seconds = time.perf_counter() - phase_start
+                else:
+                    update_seconds = time.perf_counter() - phase_start
+            record["evaluation_seconds"] = evaluation_seconds
+            record["sampling_seconds"] = sampling_seconds
+            record["metrics_seconds"] = metrics_seconds
+            record["update_seconds"] = update_seconds
+            record["shift_seconds"] = shift_seconds
+            record["synchronize_seconds"] = synchronize_seconds
+            if cuda_device is not None and torch.cuda.is_available():
+                record["peak_memory_gigabytes"] = (
+                    torch.cuda.max_memory_allocated(cuda_device) / 2 ** 30)
+                record["peak_reserved_memory_gigabytes"] = (
+                    torch.cuda.max_memory_reserved(cuda_device) / 2 ** 30)
+            record["iteration_seconds"] = time.perf_counter() - iteration_start_time
+            print(format_record(record))
+            # 先写日志再保存：若在两者之间被杀，恢复时截断会丢掉这轮日志并重跑，不会永久缺一轮
+            log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if (iteration + 1) % config.checkpoint_interval == 0 or iteration + 1 == config.iterations:
+                save_checkpoint(run_directory, iteration + 1, model, optimizer, scheduler,
+                                random_generator, device=config.device,
+                                schedule_horizon=schedule_horizon)
+
+        final_record = {"iteration": config.iterations}
+        if evaluation_dataset:      # 训练结束后的最终评测
+            final_record.update(evaluate(backend, tokenizer, environment_factory,
+                                         evaluation_dataset, config.max_steps,
+                                         truncated_reward=config.truncated_reward))
+        # 两次运行结果一模一样时，用它区分"权重相同"和"权重不同但贪心输出相同"
+        final_record["trainable_parameter_checksum"] = sum(
+            parameter.detach().double().abs().sum().item() for parameter in trainable_params)
+        print(format_record(final_record))
+        log_file.write(json.dumps(final_record, ensure_ascii=False) + "\n")
+    return run_directory

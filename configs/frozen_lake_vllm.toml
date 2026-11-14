@@ -1,0 +1,32 @@
+# 冰湖寻路：GRPO 对 GiGPO 的对比任务。
+# 算法用 --set training.algorithm=grpo 或 gigpo 切换。
+
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+dtype = "bfloat16"
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 8
+temperature = 1.0
+max_concurrent_requests = 64
+
+[task]
+environment = "examples.frozen_lake:FrozenLakeEnvironment"
+environment_options = { reward_mode = "progress" }
+dataset = "examples.frozen_lake:make_dataset"
+train_dataset_options = { size = 2000, seed = 0, grid_size = 4, hole_count = 2 }
+evaluation_dataset_options = { size = 200, seed = 1, grid_size = 4, hole_count = 2 }
+
+[training]
+algorithm = "gigpo"
+iterations = 60
+groups_per_iteration = 16
+group_size = 8
+max_steps = 12
+learning_rate = 1e-5
+merge_append_only_turns = true
+max_rows_per_minibatch = 32
+evaluation_interval = 10
+checkpoint_interval = 10

@@ -1,0 +1,23 @@
+# 不提示当前区间：模型只能从对话历史推断答案范围
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+lora_rank = 16
+lora_alpha = 32
+
+[backend]
+max_new_tokens = 32
+temperature = 1.0
+
+[task]
+environment = "examples.guess_number:GuessNumberEnvironment"
+environment_options = { reveal_interval = false }
+dataset = "examples.guess_number:make_dataset"
+train_dataset_options = { size = 2000, seed = 0 }
+evaluation_dataset_options = { size = 200, seed = 1 }
+
+[training]
+algorithm = "gigpo"
+max_steps = 6
+iterations = 30
+groups_per_iteration = 16
+evaluation_interval = 5

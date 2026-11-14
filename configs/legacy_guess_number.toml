@@ -1,0 +1,22 @@
+# 最初版本：旧提示词、不提示区间、稀疏回报。预检应能抓住起步没有信号的问题。
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+lora_rank = 16
+lora_alpha = 32
+
+[backend]
+max_new_tokens = 32
+temperature = 1.0
+
+[task]
+environment = "examples.legacy_guess_number:LegacyGuessNumberEnvironment"
+dataset = "examples.legacy_guess_number:make_dataset"
+train_dataset_options = { size = 2000, seed = 0 }
+evaluation_dataset_options = { size = 200, seed = 1 }
+
+[training]
+algorithm = "grpo"
+max_steps = 6
+iterations = 30
+groups_per_iteration = 16
+evaluation_interval = 5

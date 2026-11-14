@@ -1,0 +1,22 @@
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+lora_rank = 16
+lora_alpha = 32
+
+[backend]
+max_new_tokens = 32
+temperature = 1.0
+
+[task]
+reward_function = "examples.arithmetic:reward_function"
+success_function = "examples.arithmetic:is_correct"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0 }
+evaluation_dataset_options = { size = 200, seed = 1 }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 30
+groups_per_iteration = 16
+evaluation_interval = 5

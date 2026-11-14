@@ -1,0 +1,38 @@
+# GSM8K 和计算题混合训练：检验模型能不能学会按需使用计算器。
+# 环境和带计算器的 GSM8K 相同，只是数据集换成混合的。
+
+[model]
+name = "Qwen/Qwen2.5-1.5B-Instruct"
+dtype = "bfloat16"
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 512          # GSM8K 的题常常一步答完，需要比纯计算题更长的额度
+temperature = 1.0
+max_concurrent_requests = 64
+stop_strings = ["</calc>"]
+
+[task]
+environment = "examples.gsm8k_calculator:CalculatorEnvironment"
+environment_options = { success_function = "examples.gsm8k:success_function", reward_function = "examples.gsm8k:reward_function", question_field = "question", prompt_variant = "optional_tool", maximum_response_characters = 5000, source_field = "source", call_cost = 0.02 }
+dataset = "examples.mixed_calculation:make_dataset"
+train_dataset_options = { split = "train", size = 4000, seed = 0, calculation_fraction = 0.5 }
+evaluation_dataset_options = { split = "test", size = 500, seed = 0, calculation_fraction = 0.5 }
+
+[training]
+algorithm = "grpo"
+iterations = 100
+groups_per_iteration = 32
+group_size = 8
+max_steps = 8
+learning_rate = 5e-5
+learning_rate_schedule = "cosine"
+final_learning_rate_fraction = 0.1
+memory_fraction = 0.65
+merge_append_only_turns = false   # 先用预检比较开和关，见说明
+max_rows_per_minibatch = 4
+max_tokens_per_minibatch = 2048
+shift_measurement_interval = 10
+evaluation_interval = 10
+checkpoint_interval = 5

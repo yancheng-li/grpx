@@ -1,0 +1,25 @@
+[model]
+name = "Qwen/Qwen2.5-1.5B-Instruct"
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 768
+temperature = 1.0
+
+[task]
+reward_function = "examples.gsm8k:reward_function"
+success_function = "examples.gsm8k:success_function"
+dataset = "examples.gsm8k:make_dataset"
+train_dataset_options = { split = "train" }
+evaluation_dataset_options = { split = "test", size = 500, seed = 0 }
+
+[training]
+algorithm = "grpo"
+iterations = 100
+groups_per_iteration = 32
+group_size = 8
+max_tokens_per_minibatch = 1024
+learning_rate = 5e-5
+evaluation_interval = 10
+checkpoint_interval = 10

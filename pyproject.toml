@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grpx"
+version = "0.1.0"
+requires-python = ">=3.11"    # 配置文件用标准库 tomllib
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch",
+    "transformers>=4.56",
+    "peft",
+    "requests",    # vLLM 后端；写进依赖，避免「只装本地后端」时漏装
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+grpx = "grpx.command_line:main"
+
+[tool.setuptools.packages.find]
+include = ["grpx*"]    # examples 和 tests 不打包
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"

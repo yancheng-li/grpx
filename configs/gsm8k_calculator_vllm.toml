@@ -1,0 +1,40 @@
+# 带计算器的 GSM8K：多轮工具调用任务。
+# 除了 [task] 里的环境和 [training] 里与多轮有关的几项，其余请和 configs/gsm8k_vllm.toml 保持一致，
+# 这样两个版本的准确率才可以直接比较。
+
+[model]
+name = "Qwen/Qwen2.5-1.5B-Instruct"
+dtype = "bfloat16"
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 256          # 每一轮的上限。单轮版是 768，这里一轮只写一小段
+temperature = 1.0
+max_concurrent_requests = 64
+# 工具调用训练时打开，例如 stop_strings = ["</calc>"]。空列表 / 不写 = 旧行为。
+# stop_strings = ["</calc>"]
+
+[task]
+environment = "examples.gsm8k_calculator:CalculatorEnvironment"
+# 判定和打分都引用单轮版的函数。question_field 是样本里题目原文的字段名，
+# 需要在 examples/gsm8k.py 的 make_dataset 里加上这个字段。
+environment_options = { success_function = "examples.gsm8k:success_function", reward_function = "examples.gsm8k:reward_function", question_field = "question" }
+# 下面三行请和 configs/gsm8k_vllm.toml 的 [task] 保持一致。
+dataset = "examples.gsm8k:make_dataset"
+train_dataset_options = { split = "train" }
+evaluation_dataset_options = { split = "test", size = 500, seed = 0 }
+
+[training]
+algorithm = "grpo"
+iterations = 60
+groups_per_iteration = 32
+group_size = 8
+max_steps = 8
+learning_rate = 1e-5          # 先用 float32 预检确定，见说明
+merge_append_only_turns = true
+max_rows_per_minibatch = 16
+max_tokens_per_minibatch = 2048
+shift_measurement_interval = 5
+evaluation_interval = 10
+checkpoint_interval = 10

@@ -1,0 +1,48 @@
+# 运行产物与本地缓存
+outputs/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 密钥与本地环境
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# 实验草稿与一次性输出（勿提交）
+tmp_*
+TODO.md
+*.pt
+*.bin
+*.safetensors
+metrics.jsonl
+*_summary.json
+*_post.json
+*_probe.json
+*_compare.json
+guess_rows8_vs32_upd2.json
+calc_problems_unseen_compare*.json
+gsm8k_calculator_*.json
+mixed_post_*.json
+tmp_gsm8k_viz_data.json
