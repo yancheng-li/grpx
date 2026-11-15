@@ -15,21 +15,46 @@
 
 ## 安装
 
-需要 Python 3.11 及以上、GPU 版 PyTorch、`transformers>=4.56`、`peft`。
+需要 Python 3.11 及以上和一张支持 CUDA 的显卡。
 
-在项目根目录下：
+**第一步：安装 GPU 版 PyTorch。** 请按 [PyTorch 官网](https://pytorch.org/get-started/locally/)给出的命令安装和你的 CUDA 版本对应的包，然后确认它能用到显卡：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+输出的最后一项应该是 `True`。如果跳过这一步直接安装 grpx，有的环境下 pip 会装上不带 CUDA 的版本，预检会在检查 CUDA 时报错。
+
+**第二步：在项目根目录下安装 grpx。**
 
 ```bash
 pip install -e .
 ```
 
+其余依赖（`transformers>=4.56`、`peft` 等）会自动装上。
+
+**模型下载。** 示例使用 Hugging Face 上的 `Qwen/Qwen2.5-0.5B-Instruct`，第一次运行时会自动下载，约 1 GB。访问 Hugging Face 不稳定时，可以通过环境变量 `HF_ENDPOINT` 指定镜像站点的地址。
+
+**所有命令都要在项目根目录下执行。** 配置里的 `examples.arithmetic:reward_function` 这类写法是从当前目录开始查找模块的，换到别的目录运行会找不到 `examples` 模块。任务代码放在别处时，把它所在的目录加入 `PYTHONPATH`。
+
 ## 快速开始
+
+先用最简单的任务确认环境没问题。四位数加法是单轮任务，0.5B 的模型，几分钟跑完：
 
 ```bash
 # 1. 预检：几十秒内告诉你这份配置能不能训
-grpx doctor --config configs/guess_number.toml
+grpx doctor --config configs/arithmetic.toml
 
 # 2. 训练
+grpx train --config configs/arithmetic.toml
+```
+
+训练过程中每隔几轮会打印一次评测成功率，它应该从 0.65 左右升到 0.8 以上。
+
+多轮任务换一份配置即可，命令相同：
+
+```bash
+grpx doctor --config configs/guess_number.toml
 grpx train --config configs/guess_number.toml
 ```
 
@@ -399,6 +424,38 @@ grpx train --config configs/gsm8k_vllm.toml
 
 推理服务的启动方式见下一节，模型换成 `Qwen/Qwen2.5-1.5B-Instruct`，`--gpu-memory-utilization` 用 0.25，`--max-model-len` 用 4096。任务代码在 `examples/gsm8k.py`。
 
+## 和 TRL 的对照
+
+为了检验实现是否正确，我们用 TRL 的 `GRPOTrainer` 在 GSM8K 上做了一组设置对齐的训练。
+
+**怎么对齐的**
+
+- 模型、LoRA 设置、训练量相同：Qwen2.5-1.5B，每次更新 32 道题 × 8 条回答，更新 60 次，学习率 5e-5。
+- 提示词和回报函数是同一份代码（`examples/gsm8k.py`），TRL 一侧的脚本直接导入它们。
+- 评测用同一个脚本：两边训练出的 LoRA 权重都在完整测试集（1319 题）上贪心解码评测。
+- TRL 一侧的脚本在 `scripts/compare_trl_gsm8k.py`，使用 TRL 1.18，`loss_type="grpo"`，vLLM 采样（colocate 模式）。
+
+**结果**
+
+| | TRL 1.18 | grpx |
+|---|---|---|
+| 测试集准确率 | 0.759–0.780（三个种子） | 0.744–0.778（六次运行），对照当天重跑一次为 0.763 |
+| 每次更新的耗时 | 53–68 秒，平均约 60 秒 | 约 25 秒（一次运行） |
+| 整张显卡的显存峰值 | 18.8–20.2 GB | 22.9 GB |
+
+- **准确率一致。** 两个互相独立的实现，在相同的设置下得到范围重叠的结果。
+- **这次对照里 grpx 每次更新快一倍多，占用的显存更多。** grpx 这次运行用的是偏向速度的设置：bfloat16，小批预算 2048 个 token、最多 8 行，输出层按 512 个位置分块，步长指标每 10 轮测一次，同卡的推理服务按 `--gpu-memory-utilization 0.35` 启动。调小小批预算或推理服务的显存比例可以少占显存，但会变慢。
+- **单卡上能用的采样方式不同。** 这个规模下，TRL 不用 vLLM 时一次更新二十分钟没有跑完，并占满了 24 GB 显存；它的独立推理服务模式要求推理和训练在不同的显卡上，所以单卡只能用 colocate 模式。grpx 的本地后端和同卡的独立推理服务都可以用。
+
+**读这组数字时要知道的**
+
+- 耗时和显存各自只代表一种设置。两边都没有为这次对照专门调优，TRL 一侧尤其如此，批大小等参数是直接定的，没有尝试别的取值。不应据此得出谁更快的一般结论。
+- 每次更新的耗时随回答长度变化。TRL 三次运行里最慢的那次，模型的回答全程更长（平均约 276 个 token，另外两次是 227 和 244），被截断的也更多。回答变长的漂移我们在 grpx 上同样见过，它和用哪个框架无关。grpx 一侧只有一次运行，没有测它在种子之间的波动。
+- 两边用的 vLLM 版本不同（TRL 一侧 0.33，grpx 一侧 0.18），采样速度的差别里有这个因素。
+- 有三处没有对齐：被截断的回答，grpx 记 0 分并参与训练，TRL 是排除在损失之外；旧策略概率，grpx 每轮单独计算一遍，TRL 在每批数据只用一次时不单独计算；混合精度的具体做法。被截断的回答只占约百分之一，对准确率的影响应当很小。
+
+grpx 的目的不是比 TRL 准确率更高。它和 TRL 的差别在于：单轮和多轮任务共用一条路径、训练前的预检、训推一致的自动检查、工具调用所需的停止串，以及内置的 Dr. GRPO 和 GiGPO。只需要单轮任务上的 GRPO 时，TRL 是更成熟的选择。
+
 ## 工具调用任务
 
 工具调用就是一种多轮任务：模型在回答里写出调用，环境执行后把结果作为下一条消息返回。`examples/gsm8k_calculator.py` 是一个完整的例子，模型可以用 `<calc>表达式</calc>` 调用计算器。
@@ -668,23 +725,16 @@ base_url = ["http://localhost:8000", "http://localhost:8001"]
 
 ## 开发
 
-本项目以 [Apache License 2.0](LICENSE) 发布。近期在 `transformers` 5.22–5.23、`peft` 0.21 上测过。
-
 ```bash
 pytest
 ```
 
 单元测试不需要 GPU，也不需要下载模型。
 
+在 transformers 5.22–5.23、peft 0.21 上测过。加载模型时可能出现一条关于 `is_gradient_checkpointing` 的 FutureWarning，它来自 peft 内部，不影响使用。
+
 改动了更新路径（小批切分、合并对话、损失计算）之后，再跑一次同批对照。它在同一批轨迹上用不同的小批预算和合并开关各更新一次，结果应当一致。需要 GPU 和推理服务：
 
 ```bash
 python scripts/compare_same_batch_shift.py --config configs/guess_number_vllm.toml
 ```
-
-带计算器的 GSM8K 上，可用题内对比脚本看「没调用 / 真调用并等待 / 调用但没等」在同题内的成功率差：
-
-```bash
-python -m scripts.compare_calculator_within_question
-```
-
