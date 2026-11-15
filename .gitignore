@@ -36,7 +36,8 @@ TODO.md
 *.pt
 *.bin
 *.safetensors
-metrics.jsonl
+*.jsonl
+checkpoint-*/
 *_summary.json
 *_post.json
 *_probe.json
