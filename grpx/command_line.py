@@ -171,9 +171,9 @@ def build_environment_factory(task):
     return lambda: SingleTurnEnvironment(reward_function, success_function=success_function)
 
 
-def load_model(model_section, seed, device="cuda"):
+def load_base_model_and_tokenizer(model_section, device="cuda"):
+    """只加载基座和分词器，不套 LoRA；供预检在 PEFT 之前检查目标模块。"""
     import torch
-    from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from grpx.device import resolve_device
@@ -190,6 +190,16 @@ def load_model(model_section, seed, device="cuda"):
     torch_dtype = getattr(torch, MODEL_DTYPES[dtype_name])
     tokenizer = AutoTokenizer.from_pretrained(name)
     model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype).to(torch_device)
+    return model, tokenizer, dtype_name
+
+
+def apply_lora(model, model_section, seed, dtype_name=None):
+    """在基座上挂 LoRA；默认 target_modules=all-linear，dense 行为不变。"""
+    import torch
+    from peft import LoraConfig, get_peft_model
+
+    if dtype_name is None:
+        dtype_name = model_section.get("dtype", "float32")
     torch.manual_seed(seed)    # LoRA 的初始化也由种子决定
     model = get_peft_model(model, LoraConfig(
         r=model_section.get("lora_rank", 16),
@@ -201,7 +211,23 @@ def load_model(model_section, seed, device="cuda"):
         raise ConfigurationError("可训练参数必须是 float32（PEFT 在半精度基座上应保持适配器为 float32）")
     model.grpx_mixed_precision = dtype_name == "bfloat16"
     model.print_trainable_parameters()
-    return model, tokenizer
+    return model
+
+
+def load_model(model_section, seed, device="cuda"):
+    from grpx.doctor import judge_chat_template, summarize_lora_targets
+
+    model, tokenizer, dtype_name = load_base_model_and_tokenizer(model_section, device=device)
+    chat_check = judge_chat_template(tokenizer)
+    if chat_check.status == "失败":
+        raise ConfigurationError(f"{chat_check.detail}；{chat_check.suggestion}")
+    targets = model_section.get("lora_target_modules", "all-linear")
+    summary = summarize_lora_targets(model, targets)
+    if summary["matched_module_count"] == 0:
+        raise ConfigurationError(
+            "没有任何 Linear 模块匹配 lora_target_modules；"
+            "检查 [model].lora_target_modules 是否写对了模块名后缀")
+    return apply_lora(model, model_section, seed, dtype_name=dtype_name), tokenizer
 
 
 def build_training_config(configuration):

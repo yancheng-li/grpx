@@ -67,6 +67,13 @@ def test_dataset_size_and_answers():
     assert all(2000 <= sample["answer"] <= 19998 for sample in dataset)
 
 
+def test_dataset_prompt_is_english_and_digit_count_alias():
+    sample = make_dataset(1, digits=2, seed=0)[0]
+    assert sample["prompt"].startswith("Compute ")
+    assert "Output only the final integer" in sample["prompt"]
+    assert make_dataset(4, digit_count=3, seed=1) == make_dataset(4, digits=3, seed=1)
+
+
 def test_dataset_is_reproducible():
     assert make_dataset(8, seed=3) == make_dataset(8, seed=3)
     assert make_dataset(8, seed=3) != make_dataset(8, seed=4)

@@ -2,7 +2,10 @@ import random
 import re
 
 
-def make_dataset(size, digits=4, seed=0):
+def make_dataset(size, digits=4, seed=0, digit_count=None):
+    """生成加法题。digits / digit_count 为加数位数，默认 4（给 Qwen 快速开始用）。"""
+    if digit_count is not None:
+        digits = digit_count
     random_generator = random.Random(seed)
     lowest, highest = 10 ** (digits - 1), 10 ** digits - 1
     dataset = []
@@ -10,7 +13,11 @@ def make_dataset(size, digits=4, seed=0):
         left = random_generator.randint(lowest, highest)
         right = random_generator.randint(lowest, highest)
         dataset.append(
-            {"prompt": f"计算 {left} + {right}，只输出数字。", "answer": left + right}
+            {"prompt": (
+                f"Compute {left} + {right}. "
+                "Output only the final integer answer with no equation, "
+                "explanation, or other text."
+            ), "answer": left + right}
         )
     return dataset
 

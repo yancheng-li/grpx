@@ -11,8 +11,8 @@ import sys
 import time
 from dataclasses import dataclass
 
-from grpx.command_line import (ConfigurationError, build_model_and_backend, build_task,
-                               build_training_config)
+from grpx.command_line import (ConfigurationError, apply_lora, build_task,
+                               build_training_config, load_base_model_and_tokenizer)
 
 PASS, WARNING, FAIL = "通过", "警告", "失败"
 
@@ -467,6 +467,80 @@ def judge_memory(peak_by_phase, total, memory_fraction=None):
             f"{detail}；余量偏紧（已超上限的 {MEMORY_HEADROOM_FRACTION:.0%}），长一些的轮次可能显存不足",
             suggestion)
     return CheckResult("试更新", "显存", PASS, detail)
+
+
+def summarize_lora_targets(model, lora_target_modules):
+    """在套 PEFT 之前统计 LoRA 目标会命中哪些 Linear（含专家层 / 路由）。"""
+    import torch
+
+    linear_names = [
+        name for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+    if lora_target_modules == "all-linear":
+        matched_module_names = linear_names
+    else:
+        targets = list(lora_target_modules)
+        matched_module_names = [
+            name for name in linear_names
+            if any(name == target or name.endswith("." + target) for target in targets)
+        ]
+    expert_module_names = [name for name in matched_module_names if ".experts." in name]
+    router_module_names = [name for name in matched_module_names if name.endswith(".gate")]
+    modules_by_name = dict(model.named_modules())
+    expert_parameter_count = sum(
+        parameter.numel()
+        for name in expert_module_names
+        for parameter in modules_by_name[name].parameters()
+    )
+    return {
+        "matched_module_count": len(matched_module_names),
+        "expert_module_count": len(expert_module_names),
+        "router_module_count": len(router_module_names),
+        "expert_parameter_count": expert_parameter_count,
+    }
+
+
+def judge_lora_targets(summary):
+    """matched=0 失败；命中路由 / 专家层则警告。"""
+    results = []
+    matched = summary["matched_module_count"]
+    if matched == 0:
+        results.append(CheckResult(
+            "模型", "LoRA 目标模块", FAIL,
+            "没有任何 Linear 模块匹配 lora_target_modules",
+            "检查 [model].lora_target_modules 是否写对了模块名后缀"
+            "（例如 q_proj）；dense 模型可省略该项，默认 all-linear"))
+        return results
+    results.append(CheckResult(
+        "模型", "LoRA 目标模块", PASS,
+        f"匹配到 {matched} 个 Linear 模块"))
+    if summary["router_module_count"] > 0:
+        results.append(CheckResult(
+            "模型", "LoRA 与路由", WARNING,
+            f"有 {summary['router_module_count']} 个匹配模块名以 .gate 结尾，"
+            "路由门控可能被挂上 LoRA",
+            "MoE 上请把 lora_target_modules 显式写成注意力投影"
+            "（q_proj/k_proj/v_proj/o_proj），不要包含 gate"))
+    if summary["expert_module_count"] > 0:
+        parameter_count = summary.get("expert_parameter_count", 0)
+        results.append(CheckResult(
+            "模型", "LoRA 与专家层", WARNING,
+            f"有 {summary['expert_module_count']} 个匹配模块落在 .experts. 下"
+            f"（约 {parameter_count:,} 个参数）",
+            "专家层挂 LoRA 会急剧增大可训练参数与显存；"
+            "MoE 上请显式指定注意力投影作为 lora_target_modules"))
+    return results
+
+
+def judge_chat_template(tokenizer):
+    template = getattr(tokenizer, "chat_template", None)
+    if template is None or not str(template).strip():
+        return CheckResult(
+            "模型", "对话模板", FAIL,
+            "tokenizer.chat_template 为空",
+            "换用带 chat_template 的 Instruct 模型，或自行设置 tokenizer.chat_template")
+    return CheckResult("模型", "对话模板", PASS, "tokenizer.chat_template 已设置")
 
 
 def shared_gpu_memory_hint(memory_fraction, threshold=None):
@@ -975,15 +1049,35 @@ def run_doctor(configuration, output=print):
     output("加载模型……")
     backend = None
     try:
-        model, tokenizer, backend = build_model_and_backend(
-            configuration, config.seed, adapter_directory=adapter_directory)
-    except ConfigurationError as error:
-        report.add(CheckResult("模型", "加载", FAIL, str(error), "按提示修改 [model] 或 [backend]"))
-        output(report.summary())
-        return 1
-    model.grpx_output_logit_chunk_size = config.output_logit_chunk_size
+        training_device = configuration.get("training", {}).get("device", "cuda")
+        try:
+            model, tokenizer, dtype_name = load_base_model_and_tokenizer(
+                configuration["model"], device=training_device)
+        except ConfigurationError as error:
+            report.add(CheckResult("模型", "加载", FAIL, str(error), "按提示修改 [model] 或 [backend]"))
+            output(report.summary())
+            return 1
 
-    try:
+        report.add(judge_chat_template(tokenizer))
+        lora_targets = configuration["model"].get("lora_target_modules", "all-linear")
+        lora_summary = summarize_lora_targets(model, lora_targets)
+        report.add(*judge_lora_targets(lora_summary))
+        if report.failed:
+            output(report.summary())
+            return 1
+
+        try:
+            model = apply_lora(
+                model, configuration["model"], config.seed, dtype_name=dtype_name)
+            # 复用 build_model_and_backend 的后端装配：临时塞回已加载的模型
+            model, tokenizer, backend = _attach_backend(
+                model, tokenizer, configuration, adapter_directory=adapter_directory)
+        except ConfigurationError as error:
+            report.add(CheckResult("模型", "加载", FAIL, str(error), "按提示修改 [model] 或 [backend]"))
+            output(report.summary())
+            return 1
+        model.grpx_output_logit_chunk_size = config.output_logit_chunk_size
+
         if backend_type == "vllm":
             probe_prompt = [token_id for token_id in range(1, 9)]
             try:
@@ -1010,6 +1104,43 @@ def run_doctor(configuration, output=print):
                 backend.close()
             except Exception:    # noqa: BLE001
                 pass
+
+
+def _attach_backend(model, tokenizer, configuration, adapter_directory=None):
+    """在已加载的（含 LoRA）模型上装配后端；逻辑与 build_model_and_backend 对齐。"""
+    from pathlib import Path
+
+    from grpx.backends.common import resolve_end_token_ids
+    from grpx.backends.huggingface import HuggingFaceBackend
+    from grpx.command_line import validate_backend_section
+
+    backend_section = dict(configuration.get("backend", {}))
+    validate_backend_section(backend_section)
+    backend_type = backend_section.pop("type", "huggingface")
+    try:
+        if backend_type == "vllm":
+            from grpx.backends.vllm import VllmBackend, sanitize_adapter_name_component
+            if adapter_directory is None:
+                raise ConfigurationError("构建 vLLM 后端时需要 adapter_directory")
+            end_token_ids = resolve_end_token_ids(model, tokenizer)
+            base_name = sanitize_adapter_name_component(backend_section.pop("adapter_name", "policy"))
+            run_tag = sanitize_adapter_name_component(Path(adapter_directory).resolve().parent.name)
+            backend_section["adapter_name"] = f"{base_name}-{run_tag}"
+            server_model_name = backend_section.pop("server_model_name", None)
+            model_name = configuration["model"]["name"]
+            backend_section["expected_base_model"] = server_model_name or model_name
+            backend_section["training_model_name"] = model_name
+            backend = VllmBackend(
+                tokenizer, end_token_ids, adapter_directory=adapter_directory, **backend_section)
+            try:
+                backend.verify_server_base_model()
+            except RuntimeError as error:
+                raise ConfigurationError(str(error)) from error
+        else:
+            backend = HuggingFaceBackend(model, tokenizer, **backend_section)
+    except ValueError as error:
+        raise ConfigurationError(f"[backend] {error}") from error
+    return model, tokenizer, backend
 
 
 def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluation_dataset,

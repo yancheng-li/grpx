@@ -429,3 +429,92 @@ def test_report_counts_and_failure():
     assert not report.failed and "建议：do this" in lines[1]
     report.add(CheckResult("a", "z", FAIL, "bad"))
     assert report.failed and report.summary() == "汇总：通过 1，警告 1，失败 1"
+
+
+def _linear_stack(module_names):
+    """按 dotted 名挂若干 Linear，便于测 LoRA 目标匹配。"""
+    import torch
+
+    root = torch.nn.Module()
+    for name in module_names:
+        parent, _, leaf = name.rpartition(".")
+        holder = root
+        if parent:
+            for part in parent.split("."):
+                if not hasattr(holder, part):
+                    holder.add_module(part, torch.nn.Module())
+                holder = getattr(holder, part)
+        holder.add_module(leaf, torch.nn.Linear(4, 4, bias=False))
+    return root
+
+
+def test_summarize_lora_targets_matches_suffix_and_counts_experts_routers():
+    from grpx.doctor import summarize_lora_targets
+
+    model = _linear_stack([
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.self_attn.v_proj",
+        "model.layers.0.mlp.experts.0.gate_proj",
+        "model.layers.0.mlp.experts.0.up_proj",
+        "model.layers.0.mlp.gate",
+    ])
+    attention_only = summarize_lora_targets(
+        model, ["q_proj", "k_proj", "v_proj", "o_proj"])
+    assert attention_only["matched_module_count"] == 2
+    assert attention_only["expert_module_count"] == 0
+    assert attention_only["router_module_count"] == 0
+
+    with_mlp = summarize_lora_targets(
+        model, ["q_proj", "gate_proj", "up_proj", "gate"])
+    assert with_mlp["matched_module_count"] == 4
+    assert with_mlp["expert_module_count"] == 2
+    assert with_mlp["router_module_count"] == 1
+
+
+def test_summarize_lora_targets_all_linear_includes_experts():
+    from grpx.doctor import summarize_lora_targets
+
+    model = _linear_stack([
+        "layers.0.q_proj",
+        "layers.0.experts.3.down_proj",
+        "layers.0.gate",
+    ])
+    summary = summarize_lora_targets(model, "all-linear")
+    assert summary["matched_module_count"] == 3
+    assert summary["expert_module_count"] == 1
+    assert summary["router_module_count"] == 1
+
+
+def test_judge_lora_targets_fail_warn_pass():
+    from grpx.doctor import judge_lora_targets
+
+    failed = statuses(judge_lora_targets({
+        "matched_module_count": 0, "expert_module_count": 0, "router_module_count": 0,
+    }))
+    assert failed["LoRA 目标模块"] == FAIL
+
+    warned = statuses(judge_lora_targets({
+        "matched_module_count": 10, "expert_module_count": 8, "router_module_count": 1,
+        "expert_parameter_count": 1_000_000,
+    }))
+    assert warned["LoRA 目标模块"] == PASS
+    assert warned["LoRA 与专家层"] == WARNING
+    assert warned["LoRA 与路由"] == WARNING
+
+    ok = statuses(judge_lora_targets({
+        "matched_module_count": 32, "expert_module_count": 0, "router_module_count": 0,
+    }))
+    assert ok == {"LoRA 目标模块": PASS}
+
+
+def test_judge_chat_template():
+    from grpx.doctor import judge_chat_template
+
+    class Tokenizer:
+        def __init__(self, template):
+            self.chat_template = template
+
+    assert judge_chat_template(Tokenizer("{{ messages }}")).status == PASS
+    assert judge_chat_template(Tokenizer(None)).status == FAIL
+    assert judge_chat_template(Tokenizer("")).status == FAIL
+    assert judge_chat_template(Tokenizer("   ")).status == FAIL
