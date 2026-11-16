@@ -169,6 +169,83 @@ def test_weight_update_can_change_routing(moe_case):
     assert metrics["routing_changed_in_any_layer_fraction"] > 0.0
 
 
+def test_indices_and_logits_paths_agree_on_unwrapped_model(moe_case):
+    """未包装模型上，第三项 indices 与 logits top-k 选出的专家一致。"""
+    from grpx.routing_diagnostics import selected_experts_from_router_output
+
+    model, _ = moe_case
+    recorder = RoutingRecorder(model)
+    layer_name, module = next(iter(recorder.router_modules.items()))
+    captured = {}
+
+    def hook(_module, _inputs, output):
+        captured["output"] = output
+
+    handle = module.register_forward_hook(hook)
+    input_ids = torch.randint(0, 128, (2, 6))
+    attention_mask = torch.ones(2, 6, dtype=torch.long)
+    with torch.no_grad():
+        model(input_ids=input_ids, attention_mask=attention_mask)
+    handle.remove()
+    output = captured["output"]
+    assert isinstance(output, tuple) and len(output) >= 3
+    valid = attention_mask.reshape(-1).bool()
+    from_indices = selected_experts_from_router_output(
+        output, valid, recorder.experts_per_token,
+        expert_count=model.config.num_experts)
+    # 强制走 logits 路径：只传 (logits,)
+    from_logits = selected_experts_from_router_output(
+        (output[0],), valid, recorder.experts_per_token,
+        expert_count=model.config.num_experts)
+    assert torch.equal(from_indices, from_logits), layer_name
+
+
+def test_router_lora_perturbation_changes_routing(moe_case):
+    """PEFT 按参数注入 gate.weight 后，扰动路由 LoRA 必须让记录器看到变化。"""
+    model, _ = moe_case
+    peft_model = get_peft_model(
+        model,
+        LoraConfig(
+            r=4,
+            lora_alpha=8,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_parameters=["gate.weight"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        ),
+    )
+    recorder = RoutingRecorder(peft_model)
+    assert recorder.is_available
+    # 钩子挂在 ParamWrapper（名字仍以 .gate 结尾），不是 base_layer
+    for name, module in recorder.router_modules.items():
+        assert name.endswith(".gate")
+        assert type(module).__name__ == "ParamWrapper"
+    input_ids = torch.randint(0, 128, (2, 6))
+    attention_mask = torch.ones(2, 6, dtype=torch.long)
+    with torch.no_grad():
+        with recorder.record(attention_mask) as before:
+            peft_model(input_ids=input_ids, attention_mask=attention_mask)
+        for name, parameter in peft_model.named_parameters():
+            if parameter.requires_grad and "gate" in name and "lora_" in name:
+                parameter.add_(1.0 * torch.randn_like(parameter))
+        with recorder.record(attention_mask) as after:
+            peft_model(input_ids=input_ids, attention_mask=attention_mask)
+    metrics = summarize_routing(before, after)
+    assert metrics["routing_changed_in_any_layer_fraction"] > 0.0
+
+
+def test_summarize_lora_targets_sees_gate_weight_parameters(moe_case):
+    model, _ = moe_case
+    summary = summarize_lora_targets(
+        model,
+        ["q_proj", "k_proj", "v_proj", "o_proj"],
+        lora_target_parameters=["gate.weight"],
+    )
+    assert summary["matched_parameter_count"] > 0
+    assert all(name.endswith("gate.weight") for name in summary["matched_parameter_names"])
+    assert summary["router_module_count"] > 0
+
+
 @pytest.mark.network
 def test_qwen3_moe_chat_template_online():
     """需要下载官方分词器；默认跳过，上卡前手动：pytest -m network。"""

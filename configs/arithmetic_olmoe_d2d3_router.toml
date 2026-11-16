@@ -1,0 +1,39 @@
+# OLMoE：两位数 + 三位数混合加法，注意力 LoRA + 路由 gate.weight 按参数注入。
+# 与 configs/arithmetic_olmoe_d2d3.toml 对照：同机、同小批 4/1024、60 轮。
+# 可训练参数期望：注意力 4,194,304 + 路由 540,672 = 4,734,976。
+
+[model]
+name = "allenai/OLMoE-1B-7B-0924-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+lora_target_parameters = ["gate.weight"]
+
+[backend]
+max_new_tokens = 16
+temperature = 1.0
+max_rows_per_batch = 8
+max_tokens_per_batch = 4096
+
+[task]
+environment = "examples.arithmetic:ArithmeticEnvironment"
+dataset = "examples.arithmetic:make_mixed_digit_dataset"
+train_dataset_options = { size = 2000, seed = 0, digit_counts = [2, 3] }
+evaluation_dataset_options = { size = 200, seed = 1, digit_counts = [2, 3] }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 60
+groups_per_iteration = 16
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 10
+checkpoint_interval = 20
+run_name = "olmoe-arith-d2d3-router"
+memory_fraction = 0.9
+max_tokens_per_minibatch = 1024
+max_rows_per_minibatch = 4
+shift_measurement_interval = 1

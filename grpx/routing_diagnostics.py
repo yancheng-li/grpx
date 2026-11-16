@@ -12,8 +12,10 @@
         metrics = summarize_routing(before, after)
 
 路由模块按名字识别：名字等于 router_module_name 或以 "." + router_module_name 结尾。
-OLMoE 里是每层的 `mlp.gate`（旧版是 Linear，新版是 OlmoeTopKRouter）；钩子取路由
-logits，形状是 (批大小 * 序列长度, 专家数)。若 forward 返回元组，取第一个元素。
+OLMoE 里是每层的 `mlp.gate`（旧版是 Linear，新版是 OlmoeTopKRouter；PEFT 按参数
+注入后是 ParamWrapper，base_layer 仍是 OlmoeTopKRouter）。钩子必须挂在包装层上，
+读最终输出。若 forward 返回元组且长度 ≥ 3，优先用第三项（模型实际选中的专家索引）；
+否则用第一项 logits 再 top-k。
 """
 
 from __future__ import annotations
@@ -46,6 +48,74 @@ def _resolve_experts_per_token(model: torch.nn.Module) -> int | None:
         if value is not None:
             return value
     return None
+
+
+def _resolve_expert_count(module: torch.nn.Module) -> int | None:
+    """从路由模块（或 PEFT base_layer）的 weight 形状取专家数。"""
+    for candidate in (module, getattr(module, "base_layer", None)):
+        if candidate is None:
+            continue
+        weight = getattr(candidate, "weight", None)
+        if torch.is_tensor(weight) and weight.ndim >= 1:
+            return int(weight.shape[0])
+    return None
+
+
+def selected_experts_from_router_output(
+    output,
+    valid_positions: torch.Tensor,
+    experts_per_token: int,
+    expert_count: int | None = None,
+) -> torch.Tensor:
+    """把路由 forward 的输出转成 (有效位置数, 专家数) 的布尔选中矩阵。
+
+    优先用元组第三项（indices）；否则用第一项 / 张量 logits 做 top-k。
+    """
+    indices = None
+    router_logits = None
+    if isinstance(output, tuple):
+        if len(output) >= 3 and torch.is_tensor(output[2]):
+            indices = output[2].detach()
+        router_logits = output[0] if torch.is_tensor(output[0]) else None
+    elif torch.is_tensor(output):
+        router_logits = output.detach()
+
+    if indices is not None:
+        if indices.ndim == 1:
+            indices = indices.unsqueeze(-1)
+        indices = indices.reshape(-1, indices.shape[-1])
+        if indices.shape[0] != valid_positions.shape[0]:
+            raise RuntimeError(
+                f"路由 indices 的位置数 {indices.shape[0]} 和 attention_mask 的 "
+                f"{valid_positions.shape[0]} 对不上"
+            )
+        indices = indices[valid_positions.to(indices.device)]
+        if expert_count is None:
+            if router_logits is not None:
+                expert_count = int(router_logits.shape[-1])
+            else:
+                expert_count = int(indices.max().item()) + 1
+        selected = torch.zeros(
+            indices.shape[0], expert_count, dtype=torch.bool, device=indices.device)
+        selected.scatter_(1, indices.long(), True)
+        return selected.cpu()
+
+    if router_logits is None:
+        raise RuntimeError("路由输出既没有 indices 也没有 logits，无法记录")
+    router_logits = router_logits.detach()
+    resolved_expert_count = int(router_logits.shape[-1])
+    router_logits = router_logits.reshape(-1, resolved_expert_count)
+    if router_logits.shape[0] != valid_positions.shape[0]:
+        raise RuntimeError(
+            f"路由 logits 的位置数 {router_logits.shape[0]} 和 attention_mask 的 "
+            f"{valid_positions.shape[0]} 对不上"
+        )
+    router_logits = router_logits[valid_positions.to(router_logits.device)]
+    top_indices = router_logits.float().topk(experts_per_token, dim=-1).indices
+    selected = torch.zeros(
+        router_logits.shape, dtype=torch.bool, device=router_logits.device)
+    selected.scatter_(1, top_indices, True)
+    return selected.cpu()
 
 
 @dataclass
@@ -97,29 +167,20 @@ class RoutingRecorder:
         experts_per_token = self.experts_per_token
         handles = []
 
-        def make_hook(layer_name: str):
-            def hook(module, inputs, output):
-                # Linear 直接返回 logits；OlmoeTopKRouter 返回 (logits, scores, indices)
-                router_logits = output[0] if isinstance(output, tuple) else output
-                router_logits = router_logits.detach()
-                expert_count = router_logits.shape[-1]
-                router_logits = router_logits.reshape(-1, expert_count)
-                if router_logits.shape[0] != valid_positions.shape[0]:
-                    raise RuntimeError(
-                        f"路由输出的位置数 {router_logits.shape[0]} 和 attention_mask 的 "
-                        f"{valid_positions.shape[0]} 对不上（层 {layer_name}）"
-                    )
-                router_logits = router_logits[valid_positions.to(router_logits.device)]
-                top_indices = router_logits.float().topk(experts_per_token, dim=-1).indices
-                selected = torch.zeros(router_logits.shape, dtype=torch.bool, device=router_logits.device)
-                selected.scatter_(1, top_indices, True)
-                snapshot.selected_by_layer.setdefault(layer_name, []).append(selected.cpu())
+        def make_hook(layer_name: str, module: torch.nn.Module):
+            expert_count = _resolve_expert_count(module)
+
+            def hook(_module, _inputs, output):
+                selected = selected_experts_from_router_output(
+                    output, valid_positions, experts_per_token, expert_count=expert_count)
+                snapshot.selected_by_layer.setdefault(layer_name, []).append(selected)
 
             return hook
 
         try:
             for layer_name, module in self.router_modules.items():
-                handles.append(module.register_forward_hook(make_hook(layer_name)))
+                # 挂在包装层（ParamWrapper / 原始 gate）上，读最终输出
+                handles.append(module.register_forward_hook(make_hook(layer_name, module)))
             yield snapshot
         finally:
             for handle in handles:

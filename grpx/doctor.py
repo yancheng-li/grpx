@@ -486,8 +486,16 @@ def judge_memory(peak_by_phase, total, memory_fraction=None):
     return CheckResult("试更新", "显存", PASS, detail)
 
 
-def summarize_lora_targets(model, lora_target_modules):
-    """在套 PEFT 之前统计 LoRA 目标会命中哪些 Linear（含专家层 / 路由）。"""
+def _name_matches_targets(name, targets):
+    return any(name == target or name.endswith("." + target) for target in targets)
+
+
+def summarize_lora_targets(model, lora_target_modules, lora_target_parameters=None):
+    """在套 PEFT 之前统计 LoRA 目标：Linear 模块 + 按参数注入的目标。
+
+    lora_target_parameters 的匹配方式和 PEFT 一致：全名相等，或以 ".{后缀}" 结尾
+    （例如 "gate.weight" 命中 model.layers.0.mlp.gate.weight）。
+    """
     import torch
 
     linear_names = [
@@ -495,56 +503,106 @@ def summarize_lora_targets(model, lora_target_modules):
         if isinstance(module, torch.nn.Linear)
     ]
     if lora_target_modules == "all-linear":
-        matched_module_names = linear_names
+        matched_module_names = list(linear_names)
+        module_targets = []
     else:
-        targets = list(lora_target_modules)
+        module_targets = list(lora_target_modules)
         matched_module_names = [
             name for name in linear_names
-            if any(name == target or name.endswith("." + target) for target in targets)
+            if _name_matches_targets(name, module_targets)
         ]
+        # 非 Linear 但名字匹配的模块（如 OlmoeTopKRouter 的 .gate）也计入，便于警告
+        for name, module in model.named_modules():
+            if name in matched_module_names:
+                continue
+            if not isinstance(module, torch.nn.Linear) and _name_matches_targets(name, module_targets):
+                matched_module_names.append(name)
+
+    parameter_targets = list(lora_target_parameters or [])
+    matched_parameter_names = []
+    matched_parameter_numel = 0
+    if parameter_targets:
+        for name, parameter in model.named_parameters():
+            if _name_matches_targets(name, parameter_targets):
+                matched_parameter_names.append(name)
+                matched_parameter_numel += parameter.numel()
+
     expert_module_names = [name for name in matched_module_names if ".experts." in name]
     router_module_names = [name for name in matched_module_names if name.endswith(".gate")]
+    expert_parameter_names = [name for name in matched_parameter_names if ".experts." in name]
+    router_parameter_names = [
+        name for name in matched_parameter_names
+        if ".gate." in name and "gate_up_proj" not in name
+    ]
     modules_by_name = dict(model.named_modules())
     expert_parameter_count = sum(
         parameter.numel()
         for name in expert_module_names
         for parameter in modules_by_name[name].parameters()
+    ) + sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if name in expert_parameter_names
     )
     return {
         "matched_module_count": len(matched_module_names),
+        "matched_parameter_names": matched_parameter_names,
+        "matched_parameter_count": len(matched_parameter_names),
+        "matched_parameter_numel": matched_parameter_numel,
         "expert_module_count": len(expert_module_names),
-        "router_module_count": len(router_module_names),
+        "router_module_count": len(router_module_names) + len(set(
+            name.rsplit(".weight", 1)[0] for name in router_parameter_names
+        )),
         "expert_parameter_count": expert_parameter_count,
+        "router_parameter_names": router_parameter_names,
+        "expert_parameter_names": expert_parameter_names,
     }
 
 
 def judge_lora_targets(summary):
-    """matched=0 失败；命中路由 / 专家层则警告。"""
+    """模块与按参数注入都未命中则失败；命中路由 / 专家层则警告。"""
     results = []
     matched = summary["matched_module_count"]
-    if matched == 0:
+    matched_parameters = summary.get("matched_parameter_count", 0)
+    if matched == 0 and matched_parameters == 0:
         results.append(CheckResult(
             "模型", "LoRA 目标模块", FAIL,
-            "没有任何 Linear 模块匹配 lora_target_modules",
+            "没有任何模块或参数匹配 lora_target_modules / lora_target_parameters",
             "检查 [model].lora_target_modules 是否写对了模块名后缀"
-            "（例如 q_proj）；dense 模型可省略该项，默认 all-linear"))
+            "（例如 q_proj）；按参数注入时写 lora_target_parameters"
+            "（例如 gate.weight）；dense 模型可省略，默认 all-linear"))
         return results
-    results.append(CheckResult(
-        "模型", "LoRA 目标模块", PASS,
-        f"匹配到 {matched} 个 Linear 模块"))
-    if summary["router_module_count"] > 0:
+    if matched > 0:
+        results.append(CheckResult(
+            "模型", "LoRA 目标模块", PASS,
+            f"匹配到 {matched} 个模块"))
+    if matched_parameters > 0:
+        names = summary.get("matched_parameter_names", [])
+        preview = ", ".join(names[:3])
+        if len(names) > 3:
+            preview += f", …共 {len(names)} 个"
+        results.append(CheckResult(
+            "模型", "LoRA 目标参数", PASS,
+            f"按参数注入匹配到 {matched_parameters} 个参数"
+            f"（{summary.get('matched_parameter_numel', 0):,} 个权重）"
+            f"：{preview}"))
+    if summary["router_module_count"] > 0 or summary.get("router_parameter_names"):
+        router_params = summary.get("router_parameter_names") or []
+        detail = (
+            f"有 {summary['router_module_count']} 处路由目标"
+            + (f"，参数如 {router_params[0]}" if router_params else "")
+            + "，路由门控会被挂上 LoRA"
+        )
         results.append(CheckResult(
             "模型", "LoRA 与路由", WARNING,
-            f"有 {summary['router_module_count']} 个匹配模块名以 .gate 结尾，"
-            "路由门控可能被挂上 LoRA",
-            "MoE 上请把 lora_target_modules 显式写成注意力投影"
-            "（q_proj/k_proj/v_proj/o_proj），不要包含 gate"))
-    if summary["expert_module_count"] > 0:
+            detail,
+            "这是「放开路由」实验的预期设置；若只想训注意力层，"
+            "请不要在 lora_target_modules / lora_target_parameters 里包含 gate"))
+    if summary["expert_module_count"] > 0 or summary.get("expert_parameter_names"):
         parameter_count = summary.get("expert_parameter_count", 0)
         results.append(CheckResult(
             "模型", "LoRA 与专家层", WARNING,
-            f"有 {summary['expert_module_count']} 个匹配模块落在 .experts. 下"
-            f"（约 {parameter_count:,} 个参数）",
+            f"有专家层目标被匹配（约 {parameter_count:,} 个参数）",
             "专家层挂 LoRA 会急剧增大可训练参数与显存；"
             "MoE 上请显式指定注意力投影作为 lora_target_modules"))
     return results
@@ -1077,7 +1135,9 @@ def run_doctor(configuration, output=print):
 
         report.add(judge_chat_template(tokenizer))
         lora_targets = configuration["model"].get("lora_target_modules", "all-linear")
-        lora_summary = summarize_lora_targets(model, lora_targets)
+        lora_target_parameters = configuration["model"].get("lora_target_parameters")
+        lora_summary = summarize_lora_targets(
+            model, lora_targets, lora_target_parameters=lora_target_parameters)
         report.add(*judge_lora_targets(lora_summary))
         if report.failed:
             output(report.summary())

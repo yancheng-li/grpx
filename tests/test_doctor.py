@@ -490,12 +490,14 @@ def test_judge_lora_targets_fail_warn_pass():
 
     failed = statuses(judge_lora_targets({
         "matched_module_count": 0, "expert_module_count": 0, "router_module_count": 0,
+        "matched_parameter_count": 0,
     }))
     assert failed["LoRA 目标模块"] == FAIL
 
     warned = statuses(judge_lora_targets({
         "matched_module_count": 10, "expert_module_count": 8, "router_module_count": 1,
-        "expert_parameter_count": 1_000_000,
+        "expert_parameter_count": 1_000_000, "matched_parameter_count": 0,
+        "router_parameter_names": [], "expert_parameter_names": [],
     }))
     assert warned["LoRA 目标模块"] == PASS
     assert warned["LoRA 与专家层"] == WARNING
@@ -503,8 +505,19 @@ def test_judge_lora_targets_fail_warn_pass():
 
     ok = statuses(judge_lora_targets({
         "matched_module_count": 32, "expert_module_count": 0, "router_module_count": 0,
+        "matched_parameter_count": 0,
     }))
     assert ok == {"LoRA 目标模块": PASS}
+
+    param_warned = statuses(judge_lora_targets({
+        "matched_module_count": 4, "expert_module_count": 0, "router_module_count": 16,
+        "matched_parameter_count": 16, "matched_parameter_numel": 2_097_152,
+        "matched_parameter_names": ["model.layers.0.mlp.gate.weight"],
+        "router_parameter_names": ["model.layers.0.mlp.gate.weight"],
+        "expert_parameter_names": [], "expert_parameter_count": 0,
+    }))
+    assert param_warned["LoRA 目标参数"] == PASS
+    assert param_warned["LoRA 与路由"] == WARNING
 
 
 def test_judge_chat_template():

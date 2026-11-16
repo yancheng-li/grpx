@@ -20,7 +20,8 @@ BACKEND_VLLM_KEYS = {
 BACKEND_COMMON_KEYS = {"type", "max_new_tokens", "temperature", "stop_strings"}
 
 ALLOWED_KEYS = {
-    "model": {"name", "dtype", "lora_rank", "lora_alpha", "lora_target_modules"},
+    "model": {"name", "dtype", "lora_rank", "lora_alpha", "lora_target_modules",
+              "lora_target_parameters"},
     "backend": BACKEND_COMMON_KEYS | BACKEND_HUGGINGFACE_KEYS | BACKEND_VLLM_KEYS,
     "task": {"environment", "environment_options", "reward_function", "success_function",
              "dataset", "train_dataset_options", "evaluation_dataset_options"},
@@ -194,18 +195,28 @@ def load_base_model_and_tokenizer(model_section, device="cuda"):
 
 
 def apply_lora(model, model_section, seed, dtype_name=None):
-    """在基座上挂 LoRA；默认 target_modules=all-linear，dense 行为不变。"""
+    """在基座上挂 LoRA；默认 target_modules=all-linear，dense 行为不变。
+
+    可选 [model].lora_target_parameters：按参数名后缀注入（PEFT ParamWrapper），
+    用于 OlmoeTopKRouter 的 gate.weight 等非 Linear 目标。
+    """
     import torch
     from peft import LoraConfig, get_peft_model
 
     if dtype_name is None:
         dtype_name = model_section.get("dtype", "float32")
     torch.manual_seed(seed)    # LoRA 的初始化也由种子决定
-    model = get_peft_model(model, LoraConfig(
-        r=model_section.get("lora_rank", 16),
-        lora_alpha=model_section.get("lora_alpha", 32),
-        lora_dropout=0.0, task_type="CAUSAL_LM",
-        target_modules=model_section.get("lora_target_modules", "all-linear")))
+    config_kwargs = {
+        "r": model_section.get("lora_rank", 16),
+        "lora_alpha": model_section.get("lora_alpha", 32),
+        "lora_dropout": 0.0,
+        "task_type": "CAUSAL_LM",
+        "target_modules": model_section.get("lora_target_modules", "all-linear"),
+    }
+    target_parameters = model_section.get("lora_target_parameters")
+    if target_parameters:
+        config_kwargs["target_parameters"] = list(target_parameters)
+    model = get_peft_model(model, LoraConfig(**config_kwargs))
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not all(parameter.dtype == torch.float32 for parameter in trainable):
         raise ConfigurationError("可训练参数必须是 float32（PEFT 在半精度基座上应保持适配器为 float32）")
@@ -222,11 +233,12 @@ def load_model(model_section, seed, device="cuda"):
     if chat_check.status == "失败":
         raise ConfigurationError(f"{chat_check.detail}；{chat_check.suggestion}")
     targets = model_section.get("lora_target_modules", "all-linear")
-    summary = summarize_lora_targets(model, targets)
-    if summary["matched_module_count"] == 0:
+    target_parameters = model_section.get("lora_target_parameters")
+    summary = summarize_lora_targets(model, targets, lora_target_parameters=target_parameters)
+    if summary["matched_module_count"] == 0 and summary.get("matched_parameter_count", 0) == 0:
         raise ConfigurationError(
-            "没有任何 Linear 模块匹配 lora_target_modules；"
-            "检查 [model].lora_target_modules 是否写对了模块名后缀")
+            "没有任何模块或参数匹配 lora_target_modules / lora_target_parameters；"
+            "检查模块名后缀（例如 q_proj）或参数后缀（例如 gate.weight）")
     return apply_lora(model, model_section, seed, dtype_name=dtype_name), tokenizer
 
 
