@@ -1,0 +1,44 @@
+# Qwen3-30B-A3B：双卡乘法训练。
+# 卡 0：训练端（本配置）；卡 1：vLLM（CUDA_VISIBLE_DEVICES=1，--enable-lora
+# --max-lora-rank 64，--gpu-memory-utilization 0.9，--max-model-len 1024）。
+#
+# 难度：乘法 digits=3（预检成功率约 0.4、有信号约 0.5–0.75）。
+# 小批：32 行 / 4096 token（预检峰值约 71 GB / 上限 90 GB）。
+
+[model]
+name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 24
+temperature = 1.0
+max_concurrent_requests = 64
+
+[task]
+environment = "examples.arithmetic:ArithmeticEnvironment"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0, digits = 3, operation = "multiplication" }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 3, operation = "multiplication" }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 100
+groups_per_iteration = 32
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 10
+checkpoint_interval = 20
+run_name = "qwen3-moe-mul-d3-s0"
+seed = 0
+device = "cuda:0"
+memory_fraction = 0.95
+max_tokens_per_minibatch = 4096
+max_rows_per_minibatch = 32
+shift_measurement_interval = 1
