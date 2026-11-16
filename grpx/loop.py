@@ -276,7 +276,7 @@ class _PeakBatchTracker:
             self.best = {**_batch_shape(batch), "phase": phase,
                          "peak_gigabytes": peak_bytes / 2 ** 30}
 
-def update_policy(model, optimizer, kept, padding_token_id, config):
+def update_policy(model, optimizer, kept, padding_token_id, config, record_routing=False):
     units = prepare_update_units(kept, merge_append_only=config.merge_append_only_turns)
     merge_fraction = merged_trajectory_fraction(kept, units)
     oversized_lengths = [
@@ -292,18 +292,31 @@ def update_policy(model, optimizer, kept, padding_token_id, config):
         merge_append_only=config.merge_append_only_turns)
     if not chunks:
         # 全部超长被筛掉：跳过更新，让训练继续
-        return [], [], [], {}, merge_fraction, None, oversized_stats
+        return [], [], [], {}, merge_fraction, None, oversized_stats, None
     batches = [
         build_batch(chunk, padding_token_id, model.device, config.row_weighting)
         for chunk in chunks
     ]
 
     peak_tracker = _PeakBatchTracker(device=getattr(config, "device", None) or model.device)
+    routing_before = None
+    routing_recorder = None
+    if record_routing:
+        from grpx.routing_diagnostics import RoutingRecorder, RoutingSnapshot
+        routing_recorder = RoutingRecorder(model)
+        if routing_recorder.is_available:
+            routing_before = RoutingSnapshot()
+        else:
+            routing_recorder = None
     model.eval()
     with torch.no_grad():         # 更新前，把所有小批的旧概率算出来
         old_log_probabilities = []
         for batch in batches:
-            old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+            if routing_recorder is not None:
+                with routing_recorder.record(batch["attention_mask"], snapshot=routing_before):
+                    old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+            else:
+                old_log_probabilities.append(action_log_probabilities(model, batch)[0])
             peak_tracker.note(batch, "old_log_probs")
     gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
 
@@ -322,26 +335,44 @@ def update_policy(model, optimizer, kept, padding_token_id, config):
         torch.nn.utils.clip_grad_norm_(trainable_params, config.max_gradient_norm)
         optimizer.step()
     return (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
-            peak_tracker.best, oversized_stats)
+            peak_tracker.best, oversized_stats, routing_before)
 
-def measure_policy_shift(model, batches, old_log_probabilities, config):
+def measure_policy_shift(model, batches, old_log_probabilities, config, routing_before=None):
     """更新之后对所有小批再做一遍无梯度前向，把回答位置的对数比值收集到一起，统一算分位数。
 
     必须复用 update_policy 里算旧对数概率时的同一批 tensors（切分、顺序、补齐都相同）。
-    另建小批会在 bf16 下引入与学习率无关的路径差，把位移指标打成底噪。"""
+    另建小批会在 bf16 下引入与学习率无关的路径差，把位移指标打成底噪。
+    若传入 routing_before（来自同一次 update_policy 的旧概率前向），顺带汇总路由变化。"""
     model.eval()
     log_ratios = []
+    routing_after = None
+    routing_recorder = None
+    if routing_before is not None:
+        from grpx.routing_diagnostics import RoutingRecorder, RoutingSnapshot
+        routing_recorder = RoutingRecorder(model)
+        if routing_recorder.is_available:
+            routing_after = RoutingSnapshot()
+        else:
+            routing_recorder = None
     with torch.no_grad():
         for batch, old_log_probability in zip(batches, old_log_probabilities, strict=True):
-            new_log_probability, mask = action_log_probabilities(model, batch)
+            if routing_recorder is not None:
+                with routing_recorder.record(batch["attention_mask"], snapshot=routing_after):
+                    new_log_probability, mask = action_log_probabilities(model, batch)
+            else:
+                new_log_probability, mask = action_log_probabilities(model, batch)
             log_ratios.append((new_log_probability - old_log_probability)[mask])
     log_ratio = torch.cat(log_ratios).float()
     absolute_log_ratio = log_ratio.abs()
-    return {
+    metrics = {
         "shift_clip_fraction": ((log_ratio.exp() - 1).abs() > config.clip_range).float().mean().item(),
         "shift_median_absolute_log_ratio": absolute_log_ratio.median().item(),
         "shift_percentile_95_absolute_log_ratio": torch.quantile(absolute_log_ratio, 0.95).item(),
     }
+    if routing_after is not None:
+        from grpx.routing_diagnostics import summarize_routing
+        metrics.update(summarize_routing(routing_before, routing_after))
+    return metrics
 
 def train(model, tokenizer, backend, dataset, environment_factory, config, evaluation_dataset=None,
           resolved_configuration=None, resume_from=None, run_directory=None):
@@ -458,9 +489,12 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
             synchronize_seconds = 0.0
             if kept:
                 phase_start = time.perf_counter()
+                measure_shift = should_measure_shift(
+                    iteration, config.shift_measurement_interval)
                 (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
-                 _peak_batch, oversized_stats) = update_policy(
-                    model, optimizer, kept, padding_token_id, config
+                 _peak_batch, oversized_stats, routing_before) = update_policy(
+                    model, optimizer, kept, padding_token_id, config,
+                    record_routing=measure_shift,
                 )
                 record.update(oversized_stats)
                 record["merged_trajectory_fraction"] = merge_fraction
@@ -470,10 +504,11 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                     enforce_backend_log_probability_gap(
                         gap_metrics, hard=gap_hard_check_pending)
                     gap_hard_check_pending = False
-                    if should_measure_shift(iteration, config.shift_measurement_interval):
+                    if measure_shift:
                         shift_start = time.perf_counter()
                         record.update(measure_policy_shift(
-                            model, batches, old_log_probabilities, config))
+                            model, batches, old_log_probabilities, config,
+                            routing_before=routing_before))
                         shift_seconds = time.perf_counter() - shift_start
                     scheduler.step()
                     # 位移前向从 update_seconds 拆出，便于不同间隔之间比较更新耗时

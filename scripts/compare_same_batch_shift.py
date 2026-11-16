@@ -89,7 +89,7 @@ def main():
             optimizer = torch.optim.AdamW(list(trainable.values()), lr=trial_config.learning_rate)
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
-            history, batches, old_log_probabilities, gap_metrics, merge_fraction, _peak, _over = update_policy(
+            history, batches, old_log_probabilities, gap_metrics, merge_fraction, _peak, _over, _routing = update_policy(
                 model, optimizer, kept, padding_token_id, trial_config)
             shift = measure_policy_shift(model, batches, old_log_probabilities, trial_config)
             if torch.cuda.is_available():

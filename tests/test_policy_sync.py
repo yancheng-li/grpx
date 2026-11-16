@@ -88,7 +88,8 @@ def test_train_syncs_before_loop_and_after_updates(tmp_path, monkeypatch):
 
     monkeypatch.setattr(loop_module, "collect_trajectories", fake_collect)
     monkeypatch.setattr(loop_module, "update_policy", lambda *args, **kwargs: (
-        [{"loss": 0.0, "max_ratio_deviation": 0.0, "approximate_kl": 0.0}], [], [], {}, 0.0, None))
+        [{"loss": 0.0, "max_ratio_deviation": 0.0, "approximate_kl": 0.0}],
+        [], [], {}, 0.0, None, {}, None))
     monkeypatch.setattr(loop_module, "measure_policy_shift", lambda *args, **kwargs: {
         "shift_clip_fraction": 0.0,
         "shift_median_absolute_log_ratio": 0.0,
@@ -144,7 +145,8 @@ def test_resume_syncs_after_checkpoint_load(tmp_path, monkeypatch):
     monkeypatch.setattr(loop_module, "truncate_metrics", lambda *args, **kwargs: 0)
     monkeypatch.setattr(loop_module, "collect_trajectories", fake_collect)
     monkeypatch.setattr(loop_module, "update_policy", lambda *args, **kwargs: (
-        [{"loss": 0.0, "max_ratio_deviation": 0.0, "approximate_kl": 0.0}], [], [], {}, 0.0, None))
+        [{"loss": 0.0, "max_ratio_deviation": 0.0, "approximate_kl": 0.0}],
+        [], [], {}, 0.0, None, {}, None))
     monkeypatch.setattr(loop_module, "measure_policy_shift", lambda *args, **kwargs: {
         "shift_clip_fraction": 0.0,
         "shift_median_absolute_log_ratio": 0.0,

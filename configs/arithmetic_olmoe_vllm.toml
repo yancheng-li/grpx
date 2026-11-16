@@ -1,0 +1,39 @@
+# OLMoE + vLLM：两位数加法，30 轮，专门核对两端对数概率差。
+# 与专家层训练错开空档跑；服务端需 enable-lora，且基座同名。
+
+[model]
+name = "allenai/OLMoE-1B-7B-0924-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[backend]
+type = "vllm"
+base_url = "http://localhost:8000"
+max_new_tokens = 16
+temperature = 1.0
+max_concurrent_requests = 64
+
+[task]
+environment = "examples.arithmetic:ArithmeticEnvironment"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0, digits = 2 }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 2 }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 30
+groups_per_iteration = 16
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 30
+checkpoint_interval = 10
+run_name = "olmoe-arith-d2-vllm"
+# 与 vLLM 共卡时留余量；独占卡可调到 0.9
+memory_fraction = 0.55
+max_tokens_per_minibatch = 1024
+max_rows_per_minibatch = 4
+shift_measurement_interval = 1

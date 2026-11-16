@@ -1,0 +1,33 @@
+# OLMoE 三位数加法预检 / 对照：只挂注意力层，英文提示。
+
+[model]
+name = "allenai/OLMoE-1B-7B-0924-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+[backend]
+max_new_tokens = 128
+temperature = 1.0
+
+[task]
+environment = "examples.arithmetic:ArithmeticEnvironment"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0, digits = 3 }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 3 }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 30
+groups_per_iteration = 16
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 30
+checkpoint_interval = 10
+run_name = "olmoe-arith-d3"
+memory_fraction = 0.9
+max_tokens_per_minibatch = 1024
+max_rows_per_minibatch = 4

@@ -1,0 +1,41 @@
+# 注意力 + 专家投影挂 LoRA（对照用）。
+#
+# 注意：当前 transformers 的 OLMoE 专家是打包参数
+#   mlp.experts.gate_up_proj  [64, 2048, 2048]
+#   mlp.experts.down_proj     [64, 2048, 1024]
+# 而不是 per-expert Linear。PEFT 在 target 含 up_proj/down_proj/gate_proj 时
+# 会展开成约 1.86e8 可训练参数，24GB 上试更新会卡死。
+# 全量专家 LoRA 对照需更大显存，或等 PEFT/自定义只挂部分 expert 切片。
+
+[model]
+name = "allenai/OLMoE-1B-7B-0924-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[backend]
+max_new_tokens = 128
+temperature = 1.0
+
+[task]
+reward_function = "examples.arithmetic:reward_function"
+success_function = "examples.arithmetic:is_correct"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0, digits = 2 }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 2 }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 30
+groups_per_iteration = 16
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 30
+checkpoint_interval = 10
+run_name = "olmoe-arith-d2-experts"
+memory_fraction = 0.9
+max_tokens_per_minibatch = 1024
+max_rows_per_minibatch = 4

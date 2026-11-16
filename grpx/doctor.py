@@ -440,6 +440,23 @@ def judge_shift(shift, learning_rate, mixed_precision=False):
     return CheckResult("试更新", "位移", PASS, detail)
 
 
+def judge_routing(shift, routing_available):
+    """试更新顺带报路由变化；dense 模型跳过。不据此判 PASS/FAIL。"""
+    if not routing_available:
+        return CheckResult("试更新", "路由", PASS, "未检测到 MoE 路由模块，已跳过")
+    changed_any = shift.get("routing_changed_in_any_layer_fraction")
+    changed_mean = shift.get("routing_changed_position_fraction_mean")
+    replaced = shift.get("routing_replaced_expert_fraction_mean")
+    load_entropy = shift.get("routing_load_entropy_mean")
+    detail = (
+        f"任意层变化位置比例 {changed_any:.3f}，"
+        f"层均位置变化 {changed_mean:.3f}，"
+        f"被换专家比例 {replaced:.3f}，"
+        f"负载归一化熵 {load_entropy:.3f}"
+    )
+    return CheckResult("试更新", "路由", PASS, detail)
+
+
 def judge_memory(peak_by_phase, total, memory_fraction=None):
     """按训练同款显存上限判定：超上限 FAIL，超上限的 MEMORY_HEADROOM_FRACTION 则 WARN。"""
     from grpx.loop import TRAINING_MEMORY_FRACTION
@@ -1261,15 +1278,17 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
         start = time.perf_counter()
         try:
             (history, batches, old_log_probabilities, _gap_metrics, _merge_fraction,
-             peak_batch, _oversized) = update_policy(
-                model, optimizer, kept, padding_token_id, config)
+             peak_batch, _oversized, routing_before) = update_policy(
+                model, optimizer, kept, padding_token_id, config, record_routing=True)
             if not history:
                 report.add(CheckResult(
                     "试更新", "跳过", WARNING,
                     "有信号的组全部因超过 max_tokens_per_minibatch 被跳过，无法试更新",
                     "增大 training.max_tokens_per_minibatch，或缩短对话"))
                 return
-            shift = measure_policy_shift(model, batches, old_log_probabilities, config)
+            shift = measure_policy_shift(
+                model, batches, old_log_probabilities, config,
+                routing_before=routing_before)
             if use_cuda:
                 torch.cuda.synchronize(cuda_device)
         except Exception as error:    # noqa: BLE001
@@ -1290,6 +1309,7 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
         report.add(judge_shift(
             shift, config.learning_rate,
             mixed_precision=bool(getattr(model, "grpx_mixed_precision", False))))
+        report.add(judge_routing(shift, routing_available=routing_before is not None))
         if peak_batch is not None:
             report.add(CheckResult(
                 "试更新", "峰值小批", PASS,

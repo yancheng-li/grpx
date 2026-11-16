@@ -1,0 +1,43 @@
+# OLMoE：两位数 + 三位数混合加法，注意力 + 专家投影 LoRA（对照用，勿在 24GB 上跑）。
+#
+# 当前 transformers 5.22 的 OLMoE 专家是打包参数：
+#   mlp.experts.gate_up_proj  [64, 2048, 2048]
+#   mlp.experts.down_proj     [64, 2048, 1024]
+# PEFT 在 target 含 up_proj/down_proj/gate_proj 时会扩到约 1.9 亿可训练参数，
+# 4090 24GB 上试更新会卡死。留给更大显存的租卡环境。
+
+[model]
+name = "allenai/OLMoE-1B-7B-0924-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[backend]
+max_new_tokens = 16
+temperature = 1.0
+max_rows_per_batch = 8
+max_tokens_per_batch = 4096
+
+[task]
+environment = "examples.arithmetic:ArithmeticEnvironment"
+dataset = "examples.arithmetic:make_mixed_digit_dataset"
+train_dataset_options = { size = 2000, seed = 0, digit_counts = [2, 3] }
+evaluation_dataset_options = { size = 200, seed = 1, digit_counts = [2, 3] }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 60
+groups_per_iteration = 16
+learning_rate = 1e-5
+warmup_iterations = 5
+learning_rate_schedule = "constant"
+evaluation_interval = 10
+checkpoint_interval = 20
+run_name = "olmoe-arith-d2d3-experts"
+memory_fraction = 0.9
+# 大卡上权重是固定开销；小批太碎会反复合并专家权重。4090 勿用这对值。
+max_tokens_per_minibatch = 8192
+max_rows_per_minibatch = 128
+shift_measurement_interval = 1

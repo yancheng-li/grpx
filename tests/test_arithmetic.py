@@ -65,11 +65,13 @@ def test_dataset_size_and_answers():
     dataset = make_dataset(32, digits=4)
     assert len(dataset) == 32
     assert all(2000 <= sample["answer"] <= 19998 for sample in dataset)
+    assert all(sample["operation"] == "addition" for sample in dataset)
 
 
 def test_dataset_prompt_is_english_and_digit_count_alias():
     sample = make_dataset(1, digits=2, seed=0)[0]
     assert sample["prompt"].startswith("Compute ")
+    assert " + " in sample["prompt"]
     assert "Output only the final integer" in sample["prompt"]
     assert make_dataset(4, digit_count=3, seed=1) == make_dataset(4, digits=3, seed=1)
 
@@ -77,3 +79,74 @@ def test_dataset_prompt_is_english_and_digit_count_alias():
 def test_dataset_is_reproducible():
     assert make_dataset(8, seed=3) == make_dataset(8, seed=3)
     assert make_dataset(8, seed=3) != make_dataset(8, seed=4)
+
+
+def test_default_addition_matches_pre_operation_extension():
+    # 改动前 make_dataset(size=500, seed=1, digits=3) 的前几道题；RNG 与题面必须保持不变
+    expected = [
+        ("Compute 237 + 682. ", 919),
+        ("Compute 967 + 921. ", 1888),
+        ("Compute 882 + 164. ", 1046),
+        ("Compute 361 + 220. ", 581),
+        ("Compute 607 + 879. ", 1486),
+    ]
+    dataset = make_dataset(500, seed=1, digits=3)
+    for index, (prefix, answer) in enumerate(expected):
+        assert dataset[index]["prompt"].startswith(prefix)
+        assert dataset[index]["answer"] == answer
+        assert dataset[index]["digits"] == 3
+        assert dataset[index]["operation"] == "addition"
+    assert make_dataset(8, seed=3) == make_dataset(8, seed=3, operation="addition")
+
+
+def test_multiplication_dataset():
+    sample = make_dataset(1, digits=2, seed=0, operation="multiplication")[0]
+    assert " * " in sample["prompt"]
+    assert " + " not in sample["prompt"]
+    assert sample["operation"] == "multiplication"
+    assert sample["digits"] == 2
+    # 两位×两位：答案 2–4 位
+    assert 10 <= sample["answer"] <= 99 * 99
+    # 与加法同 seed 时操作数相同、答案不同
+    addition = make_dataset(1, digits=2, seed=0, operation="addition")[0]
+    assert sample["prompt"].split(" * ")[0] == addition["prompt"].split(" + ")[0]
+    assert sample["answer"] != addition["answer"]
+
+
+def test_operation_must_be_known():
+    with pytest.raises(ValueError, match="operation"):
+        make_dataset(1, operation="mul")
+
+
+def test_digits_can_exceed_ten():
+    sample = make_dataset(1, digits=12, seed=0)[0]
+    assert sample["digits"] == 12
+    assert len(str(sample["answer"])) >= 12
+
+
+def test_environment_metrics_split_by_operation_and_digits():
+    from examples.arithmetic import ArithmeticEnvironment
+
+    environment = ArithmeticEnvironment()
+    multiplication = make_dataset(1, digits=3, seed=0, operation="multiplication")[0]
+    messages = environment.reset(multiplication, seed=0)
+    environment.step("0")
+    metrics = environment.metrics()
+    # 乘法不再报 success_digits_*（该名历史上专指加法）
+    assert "success_digits_3" not in metrics
+    assert metrics["success_multiplication_digits_3"] == 0.0
+    assert "success_addition_digits_3" not in metrics
+
+    environment.reset(multiplication, seed=0)
+    environment.step(str(multiplication["answer"]))
+    metrics = environment.metrics()
+    assert "success_digits_3" not in metrics
+    assert metrics["success_multiplication_digits_3"] == 1.0
+
+    addition = make_dataset(1, digits=2, seed=0, operation="addition")[0]
+    environment.reset(addition, seed=0)
+    environment.step(str(addition["answer"]))
+    metrics = environment.metrics()
+    assert metrics["success_digits_2"] == 1.0
+    assert metrics["success_addition_digits_2"] == 1.0
+    assert messages  # reset 返回了对话

@@ -28,3 +28,6 @@ pythonpath = ["."]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra"
+markers = [
+    "network: needs network / Hugging Face download; skipped by default",
+]
