@@ -141,7 +141,7 @@ def test_resume_syncs_after_checkpoint_load(tmp_path, monkeypatch):
         ]
 
     monkeypatch.setattr(loop_module, "find_latest_checkpoint", lambda directory: checkpoint)
-    monkeypatch.setattr(loop_module, "load_checkpoint", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(loop_module, "load_checkpoint", lambda *args, **kwargs: (1, None))
     monkeypatch.setattr(loop_module, "truncate_metrics", lambda *args, **kwargs: 0)
     monkeypatch.setattr(loop_module, "collect_trajectories", fake_collect)
     monkeypatch.setattr(loop_module, "update_policy", lambda *args, **kwargs: (
