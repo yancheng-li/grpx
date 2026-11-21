@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as functional
 
+from grpx.gradient_checkpointing import gradient_bearing_forward
 from grpx.types import Trajectory
 
 
@@ -331,21 +332,25 @@ def train_on_batch(model, optimizer, batch, number_of_updates=1, max_gradient_no
     model.train()
     history = []
     for _ in range(number_of_updates):
-        new_log_probs, _ = action_log_probabilities(model, batch)
-        loss, metrics = grpo_loss(
-            new_log_probs, old_log_probs, mask, batch["advantages"],
-            row_weights=batch.get("row_weights"),
-            segment_ids=batch.get("segment_ids"),
-            segment_advantages=batch.get("segment_advantages"),
-            segment_weights=batch.get("segment_weights"),
-            **loss_options
-        )
+        # 反向会重算前向，训练模式要保持到 backward 结束
+        with gradient_bearing_forward(model):
+            new_log_probs, _ = action_log_probabilities(model, batch)
+            loss, metrics = grpo_loss(
+                new_log_probs, old_log_probs, mask, batch["advantages"],
+                row_weights=batch.get("row_weights"),
+                segment_ids=batch.get("segment_ids"),
+                segment_advantages=batch.get("segment_advantages"),
+                segment_weights=batch.get("segment_weights"),
+                **loss_options
+            )
+            should_step = not (max_approximate_kl is not None
+                               and metrics["approximate_kl"] > max_approximate_kl)
+            if should_step:
+                optimizer.zero_grad()
+                loss.backward()
         history.append(metrics)
-        if (max_approximate_kl is not None
-                and metrics["approximate_kl"] > max_approximate_kl):
+        if not should_step:
             break
-        optimizer.zero_grad()
-        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_gradient_norm)
         optimizer.step()
     return history

@@ -18,7 +18,22 @@ from grpx.trainer import (
 from grpx.advantage import compute_advantages
 from grpx.logging import format_record, create_run_directory
 from grpx.evaluation import evaluate
-from grpx.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint, truncate_metrics
+from grpx.checkpoint import (
+    find_latest_checkpoint, load_checkpoint, prune_rolling_checkpoints, save_checkpoint,
+    truncate_metrics,
+)
+from grpx.gradient_checkpointing import gradient_bearing_forward, gradient_checkpointing
+from grpx.iteration_state import (
+    accumulation_checkpoint_path,
+    capture_gradients,
+    load_accumulation_checkpoint,
+    load_iteration_trajectories,
+    make_fingerprint,
+    remove_accumulation_checkpoint,
+    restore_gradients,
+    save_accumulation_checkpoint,
+    save_iteration_trajectories,
+)
 from grpx.types import mean_environment_metrics, success_fraction
 from grpx.trajectory_logging import (
     append_trajectory_samples,
@@ -63,7 +78,13 @@ def collect_trajectories(
     )
 
 # 第 0 轮 LoRA 增量近零，中位数应只差精度（千分之几）；超过此值视为训推不是同一模型
-BACKEND_LOGPROB_GAP_MEDIAN_LIMIT = 0.05
+# 尾部大偏差才能把「配置错位」和「高熵任务下的正常数值噪声」分开：
+# 对齐时 |Δ|>0.5 的比例≈0、最大差≲0.3；错位时比例为百分之几、最大差可达 5–11。
+BACKEND_LOGPROB_GAP_LARGE = 0.5
+BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT = 0.001   # 0.1%
+BACKEND_LOGPROB_GAP_MAX_LIMIT = 5.0
+# p95 只作警告：高熵任务上正常也可到 0.04–0.05
+BACKEND_LOGPROB_GAP_P95_WARN = 0.01
 
 
 def measure_backend_log_probability_gap(batches, old_log_probabilities):
@@ -93,47 +114,91 @@ def measure_backend_log_probability_gap(batches, old_log_probabilities):
         return {}
     medians = {}
     percentiles = {}
+    above_half = {}
+    maxima = {}
     for url, pieces in gaps_by_url.items():
         gap = torch.cat(pieces).float()
         medians[url] = gap.median().item()
         percentiles[url] = torch.quantile(gap, 0.95).item()
-    worst_url = max(medians, key=medians.get)
+        above_half[url] = (gap > BACKEND_LOGPROB_GAP_LARGE).float().mean().item()
+        maxima[url] = gap.max().item()
+    # 最差地址按尾部大偏差排；没有尾部时退回 p95
+    worst_url = max(
+        percentiles,
+        key=lambda url: (above_half[url], maxima[url], percentiles[url]))
     metrics = {
         "backend_log_probability_gap_median": medians[worst_url],
-        "backend_log_probability_gap_p95": max(percentiles.values()),
-        "gap_by_url": medians,
+        "backend_log_probability_gap_p95": percentiles[worst_url],
+        "backend_log_probability_gap_above_half_fraction": max(above_half.values()),
+        "backend_log_probability_gap_max": max(maxima.values()),
+        "gap_by_url": percentiles,
     }
-    if len(medians) > 1:
+    if len(percentiles) > 1:
         metrics["backend_log_probability_gap_worst_url"] = worst_url or "(unknown)"
     return metrics
 
 
-def enforce_backend_log_probability_gap(gap_metrics, *, hard=False,
-                                        limit=BACKEND_LOGPROB_GAP_MEDIAN_LIMIT):
-    """进程启动后第一次有 gap 指标时硬检查；之后的轮次只警告。
-
-    hard=True 用于本进程首次核对（含 --resume），与 iteration 编号无关。
-    """
+def _gap_mismatch_message(gap_metrics):
+    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    gap_max = gap_metrics.get("backend_log_probability_gap_max")
+    p95 = gap_metrics.get("backend_log_probability_gap_p95")
     median = gap_metrics.get("backend_log_probability_gap_median")
-    if median is None or median <= limit:
-        return
+    parts = []
+    if above is not None:
+        parts.append(f"above_half_fraction={above:.2e}")
+    if gap_max is not None:
+        parts.append(f"max={gap_max:.2e}")
+    if p95 is not None:
+        parts.append(f"p95={p95:.2e}")
+    if median is not None:
+        parts.append(f"median={median:.2e}")
     message = (
-        f"backend_log_probability_gap_median={median:.3f} 超过 {limit}；"
-        "训练端和推理服务不是同一个模型（或分词器 / 对话模板不一致）。"
+        "训推对数概率差过大（" + "，".join(parts) + "）；"
+        "训练端和推理服务不是同一个模型（或分词器 / 对话模板 / RoPE 配置不一致）。"
         "请确认 vLLM 加载的基座与 [model].name 相同，"
+        "合并模型的 config.json 含有顶层 rope_theta，"
         "或用 [backend].server_model_name 声明服务端名字。"
     )
     by_url = gap_metrics.get("gap_by_url") or {}
     if len(by_url) > 1:
         detail = "、".join(
-            f"{(url or '(unknown)')}={value:.3f}" for url, value in sorted(by_url.items()))
-        message += f" 各地址中位数：{detail}。"
+            f"{(url or '(unknown)')}={value:.2e}" for url, value in sorted(by_url.items()))
+        message += f" 各地址 p95：{detail}。"
         worst = gap_metrics.get("backend_log_probability_gap_worst_url")
         if worst:
             message += f" 最差地址：{worst}。"
-    if hard:
-        raise RuntimeError(message)
-    warnings.warn(message, stacklevel=2)
+    return message
+
+
+def backend_log_probability_gap_is_hard_failure(gap_metrics):
+    """尾部大偏差：|Δ|>0.5 的比例 > 0.1%，或最大差 > 1。"""
+    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    gap_max = gap_metrics.get("backend_log_probability_gap_max")
+    return (
+        (above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT)
+        or (gap_max is not None and gap_max > BACKEND_LOGPROB_GAP_MAX_LIMIT)
+    )
+
+
+def enforce_backend_log_probability_gap(gap_metrics, *, hard=False):
+    """硬失败看尾部大偏差；p95 过高只警告（高熵任务下可能是正常噪声）。
+
+    hard=True 用于本进程首次核对（含 --resume），与 iteration 编号无关。
+    """
+    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+        message = _gap_mismatch_message(gap_metrics)
+        if hard:
+            raise RuntimeError(message)
+        warnings.warn(message, stacklevel=2)
+        return
+    p95 = gap_metrics.get("backend_log_probability_gap_p95")
+    if p95 is not None and p95 > BACKEND_LOGPROB_GAP_P95_WARN:
+        warnings.warn(
+            f"backend_log_probability_gap_p95={p95:.2e} 超过 {BACKEND_LOGPROB_GAP_P95_WARN:g}；"
+            "高熵任务下可能是正常噪声。"
+            "若同时出现差超过 0.5 的 token（above_half_fraction / max），才按配置错位处理。",
+            stacklevel=2,
+        )
 
 
 def public_gap_metrics(gap_metrics):
@@ -171,6 +236,63 @@ def batch_segment_weight(batch):
     weights = batch.get("segment_weights", batch["row_weights"])
     return weights.sum().item()
 
+def _warn_dropped_rows(dropped_lengths, total, max_tokens):
+    if not dropped_lengths:
+        return
+    fraction = len(dropped_lengths) / total
+    percent = 100.0 * fraction
+    base = (
+        f"本轮有 {len(dropped_lengths)} 行超过 max_tokens_per_minibatch={max_tokens}"
+        f"（最长 {max(dropped_lengths)}，占 {percent:.0f}%），已跳过不参与更新；"
+        f"对话历史可能过长"
+    )
+    # 比例高时升级措辞，避免当成普通噪声略过（与预检 5%/20% 阈值一致）
+    if fraction > 0.20:
+        warnings.warn(
+            f"严重：{base}。超过两成更新单元被丢掉，本轮几乎没在学；"
+            f"请增大 max_tokens_per_minibatch",
+            UserWarning,
+        )
+    elif fraction > 0.05:
+        warnings.warn(
+            f"注意：{base}。超过 5% 的更新单元被丢掉；建议增大 max_tokens_per_minibatch",
+            UserWarning,
+        )
+    else:
+        warnings.warn(base)
+
+
+def _minibatch_index_plan(units, max_rows, max_tokens):
+    """按长度降序后的下标划分。下标指向传入的 units，恢复时必须用同一份 units，不能重排。"""
+    order = sorted(range(len(units)), key=lambda index: row_length(units[index]), reverse=True)
+    dropped_lengths = [row_length(units[index]) for index in order
+                       if row_length(units[index]) > max_tokens]
+    _warn_dropped_rows(dropped_lengths, len(units), max_tokens)
+    kept_order = [index for index in order if row_length(units[index]) <= max_tokens]
+    chunks, current = [], []
+    current_segments = 0
+    for index in kept_order:
+        segments = segment_count(units[index])
+        if current and (
+                current_segments + segments > max_rows
+                or (len(current) + 1) * row_length(units[current[0]]) > max_tokens):
+            chunks.append(current)
+            current = []
+            current_segments = 0
+        current.append(index)
+        current_segments += segments
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def build_minibatch_plan(trajectories, config):
+    """开始累积前定死的小批划分。恢复时原样使用，不再调用切分。"""
+    units = prepare_update_units(trajectories, merge_append_only=config.merge_append_only_turns)
+    return _minibatch_index_plan(
+        units, config.max_rows_per_minibatch, config.max_tokens_per_minibatch)
+
+
 def split_into_row_chunks(trajectories, max_rows, max_tokens, merge_append_only=False):
     """按更新单元切小批：默认每步一行；merge_append_only 时追加式轨迹合并为一行。
     max_rows 限制的是段数（步数），不是合并后的物理行数；另限制 行数 × 补齐后长度。
@@ -178,49 +300,15 @@ def split_into_row_chunks(trajectories, max_rows, max_tokens, merge_append_only=
     单行已超过 max_tokens 的对话无法安全更新（单独成批也会顶满甚至 OOM），
     在组批前丢掉并每轮汇总一条警告，避免训练整体崩溃。
     """
-    rows = prepare_update_units(trajectories, merge_append_only=merge_append_only)
-    # 按长度降序排列，长度相近的放在一起，减少补齐浪费；每批的第一行就是该批最长的
-    rows.sort(key=row_length, reverse=True)
-    dropped_lengths = [row_length(row) for row in rows if row_length(row) > max_tokens]
-    if dropped_lengths:
-        total = len(rows)
-        fraction = len(dropped_lengths) / total
-        percent = 100.0 * fraction
-        base = (
-            f"本轮有 {len(dropped_lengths)} 行超过 max_tokens_per_minibatch={max_tokens}"
-            f"（最长 {max(dropped_lengths)}，占 {percent:.0f}%），已跳过不参与更新；"
-            f"对话历史可能过长"
-        )
-        # 比例高时升级措辞，避免当成普通噪声略过（与预检 5%/20% 阈值一致）
-        if fraction > 0.20:
-            warnings.warn(
-                f"严重：{base}。超过两成更新单元被丢掉，本轮几乎没在学；"
-                f"请增大 max_tokens_per_minibatch",
-                UserWarning,
-            )
-        elif fraction > 0.05:
-            warnings.warn(
-                f"注意：{base}。超过 5% 的更新单元被丢掉；建议增大 max_tokens_per_minibatch",
-                UserWarning,
-            )
-        else:
-            warnings.warn(base)
-    rows = [row for row in rows if row_length(row) <= max_tokens]
-    chunks, current = [], []
-    current_segments = 0
-    for row in rows:
-        segments = segment_count(row)
-        if current and (
-                current_segments + segments > max_rows
-                or (len(current) + 1) * row_length(current[0]) > max_tokens):
-            chunks.append(current)
-            current = []
-            current_segments = 0
-        current.append(row)
-        current_segments += segments
-    if current:
-        chunks.append(current)
-    return chunks
+    units = prepare_update_units(trajectories, merge_append_only=merge_append_only)
+    plan = _minibatch_index_plan(units, max_rows, max_tokens)
+    return [[units[index] for index in group] for group in plan]
+
+
+def _chunks_from_plan(units, minibatch_plan):
+    if any(index < 0 or index >= len(units) for group in minibatch_plan for index in group):
+        raise ValueError("小批划分方案与当前轨迹不一致，不能按这份方案累积")
+    return [[units[index] for index in group] for group in minibatch_plan]
 
 def _batch_shape(batch):
     return {
@@ -230,25 +318,7 @@ def _batch_shape(batch):
         else int(batch["advantages"].shape[0]),
     }
 
-def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tracker=None):
-    """各小批的损失按段权重之和的占比加权后累积梯度，结果等于全体段一次算出的梯度；返回按同样权重平均的指标"""
-    total_weight = sum(batch_segment_weight(batch) for batch in batches)
-    weighted_metrics = []
-    for batch, old_log_probability in zip(batches, old_log_probabilities):
-        new_log_probability, mask = action_log_probabilities(model, batch)
-        loss, metrics = grpo_loss(
-            new_log_probability, old_log_probability, mask, batch["advantages"],
-            row_weights=batch["row_weights"],
-            segment_ids=batch.get("segment_ids"),
-            segment_advantages=batch.get("segment_advantages"),
-            segment_weights=batch.get("segment_weights"),
-            **loss_options(config)
-        )
-        weight = batch_segment_weight(batch) / total_weight
-        (loss * weight).backward()
-        if peak_tracker is not None:
-            peak_tracker.note(batch, "backward")
-        weighted_metrics.append((weight, metrics))
+def _average_weighted_metrics(weighted_metrics):
     # max_ 开头的取各批最大值，加权平均会把单个小批的大偏差稀释掉；
     # 中位数和分位数按批加权平均并不是真正的全局分位数，单次更新时它们恒为零，只看 measure_policy_shift 的
     return {
@@ -256,6 +326,58 @@ def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tra
                else sum(weight * metrics[name] for weight, metrics in weighted_metrics))
         for name in weighted_metrics[0][1]
     }
+
+
+def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tracker=None,
+                         accumulation=None):
+    """各小批的损失按段权重之和的占比加权后累积梯度，结果等于全体段一次算出的梯度；返回按同样权重平均的指标。
+
+    total_weight 在循环前算完。accumulation 不为空时，每 K 个小批把梯度写盘；
+    指纹对不上就丢弃，从第一个小批重算。全部累积完立刻删掉中途文件，裁剪和更新由调用方在这之后做。
+    """
+    total_weight = sum(batch_segment_weight(batch) for batch in batches)
+    start_index = 0
+    weighted_metrics = []
+    if accumulation is not None:
+        trainable_names = [name for name, parameter in model.named_parameters()
+                           if parameter.requires_grad]
+        restored = load_accumulation_checkpoint(
+            accumulation["path"], accumulation["fingerprint"], total_weight, len(batches),
+            trainable_names)
+        if restored is not None:
+            start_index = restored["next_index"]
+            weighted_metrics = [(item[0], item[1]) for item in restored["weighted_metrics"]]
+            restore_gradients(model, restored["gradients"])
+            print(f"累积梯度从第 {start_index} 个小批继续（本轮共 {len(batches)} 个小批）")
+    for index, (batch, old_log_probability) in enumerate(zip(batches, old_log_probabilities)):
+        if index < start_index:
+            continue
+        # 反向会重算前向，模式必须保持到 backward 结束；无梯度的前向不进这里
+        with gradient_bearing_forward(model):
+            new_log_probability, mask = action_log_probabilities(model, batch)
+            loss, metrics = grpo_loss(
+                new_log_probability, old_log_probability, mask, batch["advantages"],
+                row_weights=batch["row_weights"],
+                segment_ids=batch.get("segment_ids"),
+                segment_advantages=batch.get("segment_advantages"),
+                segment_weights=batch.get("segment_weights"),
+                **loss_options(config)
+            )
+            weight = batch_segment_weight(batch) / total_weight
+            (loss * weight).backward()
+        if peak_tracker is not None:
+            peak_tracker.note(batch, "backward")
+        weighted_metrics.append((weight, metrics))
+        completed = index + 1
+        if (accumulation is not None and completed % accumulation["interval"] == 0
+                and completed < len(batches)):
+            save_accumulation_checkpoint(
+                accumulation["path"], accumulation["fingerprint"], completed, total_weight,
+                len(batches), weighted_metrics, capture_gradients(model))
+    if accumulation is not None:
+        # 更新还没做。这里删掉，崩溃在裁剪或 step 时会整段重算，而不会在已经 step 过的梯度上再 step 一次
+        remove_accumulation_checkpoint(accumulation["path"])
+    return _average_weighted_metrics(weighted_metrics)
 
 class _PeakBatchTracker:
     """记录全局峰值上扬时所在小批的形状；不 reset，以免干扰外层峰值统计。"""
@@ -266,8 +388,11 @@ class _PeakBatchTracker:
         self.device = device
 
     def note(self, batch, phase):
-        device = indexed_cuda_device(self.device) if self.device is not None else None
-        if device is None or not torch.cuda.is_available():
+        # 先看 CUDA 在不在：配置里的 device 可能是 "cuda"，但单元测试跑在没有 CUDA 的环境上
+        if self.device is None or not torch.cuda.is_available():
+            return
+        device = indexed_cuda_device(self.device)
+        if device is None:
             return
         torch.cuda.synchronize(device)
         peak_bytes = torch.cuda.max_memory_allocated(device)
@@ -276,20 +401,27 @@ class _PeakBatchTracker:
             self.best = {**_batch_shape(batch), "phase": phase,
                          "peak_gigabytes": peak_bytes / 2 ** 30}
 
-def update_policy(model, optimizer, kept, padding_token_id, config, record_routing=False):
+def update_policy(model, optimizer, kept, padding_token_id, config, record_routing=False,
+                  minibatch_plan=None, run_directory=None, iteration=None,
+                  trajectory_hash_value=None):
     units = prepare_update_units(kept, merge_append_only=config.merge_append_only_turns)
     merge_fraction = merged_trajectory_fraction(kept, units)
     oversized_lengths = [
         row_length(unit) for unit in units
         if row_length(unit) > config.max_tokens_per_minibatch
     ]
+    row_total = len(units)
     oversized_stats = {
         "oversized_row_count": len(oversized_lengths),
+        "oversized_row_total": row_total,
+        "oversized_row_fraction": (
+            len(oversized_lengths) / row_total if row_total else 0.0),
         "oversized_row_max_length": max(oversized_lengths) if oversized_lengths else 0,
     }
-    chunks = split_into_row_chunks(
-        kept, config.max_rows_per_minibatch, config.max_tokens_per_minibatch,
-        merge_append_only=config.merge_append_only_turns)
+    if minibatch_plan is None:
+        minibatch_plan = _minibatch_index_plan(
+            units, config.max_rows_per_minibatch, config.max_tokens_per_minibatch)
+    chunks = _chunks_from_plan(units, minibatch_plan)
     if not chunks:
         # 全部超长被筛掉：跳过更新，让训练继续
         return [], [], [], {}, merge_fraction, None, oversized_stats, None
@@ -326,8 +458,20 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
     for _ in range(config.updates_per_iteration):
         model.train()
         optimizer.zero_grad()
+        accumulation = None
+        if config.accumulation_checkpoint_interval and run_directory is not None:
+            if iteration is None or trajectory_hash_value is None:
+                raise ValueError("保存累积梯度需要本轮轮次和轨迹哈希")
+            # 每次更新前重新取权重哈希：上一次 step 之后权重变了，不能接着用上一份中途梯度
+            accumulation = {
+                "path": accumulation_checkpoint_path(run_directory),
+                "interval": config.accumulation_checkpoint_interval,
+                "fingerprint": make_fingerprint(
+                    config, iteration, trajectory_hash_value, model),
+            }
         averaged = accumulate_gradients(
-            model, batches, old_log_probabilities, config, peak_tracker=peak_tracker)
+            model, batches, old_log_probabilities, config, peak_tracker=peak_tracker,
+            accumulation=accumulation)
         history.append(averaged)
         if (config.max_approximate_kl is not None
                 and averaged["approximate_kl"] > config.max_approximate_kl):
@@ -381,6 +525,8 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
     run_directory：调用方已创建好的运行目录（例如 vLLM 需要先建目录再写适配器）。"""
     if config.length_normalization == "constant" and config.constant_length is None:
         config = dataclasses.replace(config, constant_length=backend.max_new_tokens)
+    if config.gradient_checkpointing:
+        gradient_checkpointing(model, True)
     # 输出层分块：挂到模型上，action_log_probabilities 读取
     model.grpx_output_logit_chunk_size = config.output_logit_chunk_size
     cuda_device = indexed_cuda_device(config.device)
@@ -464,17 +610,36 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                                        evaluation_dataset, config.max_steps,
                                        truncated_reward=config.truncated_reward))
                 evaluation_seconds = time.perf_counter() - phase_start
-            samples = random_generator.sample(dataset, config.groups_per_iteration)
-            phase_start = time.perf_counter()
-            trajectories = collect_trajectories(
-                backend, tokenizer, environment_factory, samples, config, iteration
-                )
-            sampling_seconds = time.perf_counter() - phase_start
-            phase_start = time.perf_counter()
-            diagnostics = {}
-            kept = compute_advantages(trajectories, normalize_std=config.normalize_std,
-                                      step_advantage_weight=config.step_advantage_weight,
-                                      discount_factor=config.discount, diagnostics=diagnostics)
+            loaded_iteration = None
+            if config.save_iteration_trajectories:
+                loaded_iteration = load_iteration_trajectories(
+                    run_directory, iteration, model, config, random_generator,
+                    device=config.device)
+            if loaded_iteration is None:
+                samples = random_generator.sample(dataset, config.groups_per_iteration)
+                phase_start = time.perf_counter()
+                trajectories = collect_trajectories(
+                    backend, tokenizer, environment_factory, samples, config, iteration
+                    )
+                sampling_seconds = time.perf_counter() - phase_start
+                phase_start = time.perf_counter()
+                diagnostics = {}
+                kept = compute_advantages(trajectories, normalize_std=config.normalize_std,
+                                          step_advantage_weight=config.step_advantage_weight,
+                                          discount_factor=config.discount, diagnostics=diagnostics)
+                minibatch_plan = None
+                trajectory_hash_value = None
+                if config.save_iteration_trajectories:
+                    minibatch_plan = build_minibatch_plan(kept, config)
+                    trajectory_hash_value = save_iteration_trajectories(
+                        run_directory, iteration, model, config, trajectories, kept,
+                        diagnostics, minibatch_plan, random_generator, device=config.device)
+                metrics_seconds = time.perf_counter() - phase_start
+            else:
+                trajectories, kept, diagnostics, minibatch_plan, trajectory_hash_value = loaded_iteration
+                sampling_seconds = 0.0
+                metrics_seconds = 0.0
+                print(f"第 {iteration} 轮轨迹已在盘上且校验通过，跳过采样")
             record.update(summarize_rollout(trajectories, kept))
             record.update(diagnostics)
             append_trajectory_samples(
@@ -483,7 +648,6 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                 select_trajectory_samples(
                     trajectories, tokenizer, TRAJECTORY_SAMPLES_PER_CLASS),
             )
-            metrics_seconds = time.perf_counter() - phase_start
             update_seconds = 0.0
             shift_seconds = 0.0
             synchronize_seconds = 0.0
@@ -495,6 +659,10 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                  _peak_batch, oversized_stats, routing_before) = update_policy(
                     model, optimizer, kept, padding_token_id, config,
                     record_routing=measure_shift,
+                    minibatch_plan=minibatch_plan,
+                    run_directory=run_directory,
+                    iteration=iteration,
+                    trajectory_hash_value=trajectory_hash_value,
                 )
                 record.update(oversized_stats)
                 record["merged_trajectory_fraction"] = merge_fraction
@@ -533,10 +701,17 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
             print(format_record(record))
             # 先写日志再保存：若在两者之间被杀，恢复时截断会丢掉这轮日志并重跑，不会永久缺一轮
             log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            if (iteration + 1) % config.checkpoint_interval == 0 or iteration + 1 == config.iterations:
-                save_checkpoint(run_directory, iteration + 1, model, optimizer, scheduler,
+            completed = iteration + 1
+            # 轨迹按这一轮开头的权重校验。间隔大于 1 时，最近的间隔检查点往往是好几轮之前的权重，
+            # 恢复会丢掉已经采样的轨迹。打开轨迹保存就每轮再写一份，并删掉更早的非间隔检查点。
+            if (config.save_iteration_trajectories or completed % config.checkpoint_interval == 0
+                    or completed == config.iterations):
+                save_checkpoint(run_directory, completed, model, optimizer, scheduler,
                                 random_generator, device=config.device,
                                 schedule_horizon=schedule_horizon)
+            if config.save_iteration_trajectories:
+                prune_rolling_checkpoints(
+                    run_directory, completed, config.checkpoint_interval, config.iterations)
 
         final_record = {"iteration": config.iterations}
         if evaluation_dataset:      # 训练结束后的最终评测

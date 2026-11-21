@@ -124,6 +124,9 @@ def test_gap_from_old_log_probabilities_ignores_unmasked_positions():
     assert metrics["backend_log_probability_gap_median"] == pytest.approx(expected.median().item())
     assert metrics["backend_log_probability_gap_p95"] == pytest.approx(
         torch.quantile(expected, 0.95).item())
+    assert metrics["backend_log_probability_gap_max"] == pytest.approx(0.5)
+    # |Δ|>0.5 不含恰好等于 0.5
+    assert metrics["backend_log_probability_gap_above_half_fraction"] == pytest.approx(0.0)
 
 
 def test_action_log_probabilities_builds_graph_unless_no_grad():

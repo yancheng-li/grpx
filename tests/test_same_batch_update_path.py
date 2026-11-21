@@ -7,6 +7,7 @@ import torch
 from transformers import GPT2Config, GPT2LMHeadModel
 
 from grpx.config import TrainingConfig
+from grpx.gradient_checkpointing import gradient_checkpointing
 from grpx.loop import accumulate_gradients, update_policy
 from grpx.types import Step, Trajectory
 
@@ -132,6 +133,34 @@ def test_segment_budget_4_8_32_same_gradients(merge):
             assert_grad_steps_close(reference[0], grads)
             for left, right in zip(reference[1], params):
                 assert torch.allclose(left, right, atol=1e-5, rtol=0)
+
+
+def test_gradient_checkpointing_matches_disabled_gradients():
+    """同一批数据，开和关梯度检查点，累积梯度相同。"""
+    kept = [
+        make_append_only_trajectory("a", 3, 1.0, start=1),
+        make_append_only_trajectory("a", 3, -1.0, start=3),
+        make_append_only_trajectory("b", 2, 0.4, start=5),
+        make_append_only_trajectory("b", 2, -0.4, start=7),
+    ]
+    config = TrainingConfig(
+        learning_rate=1e-3, clip_range=0.2, length_normalization="per_sequence",
+        max_rows_per_minibatch=4, max_tokens_per_minibatch=10**6,
+        updates_per_iteration=2, merge_append_only_turns=True,
+        gradient_checkpointing=True,
+    )
+    model_on = tiny_gpt2(0)
+    gradient_checkpointing(model_on, True)
+    assert gradient_checkpointing(model_on) is True
+    model_off = tiny_gpt2(0)
+    grads_on, params_on, _ = collect_update_gradients(
+        model_on, copy.deepcopy(kept), config, update_steps=2)
+    grads_off, params_off, _ = collect_update_gradients(
+        model_off, copy.deepcopy(kept),
+        dataclasses.replace(config, gradient_checkpointing=False), update_steps=2)
+    assert_grad_steps_close(grads_on, grads_off)
+    for left, right in zip(params_on, params_off):
+        assert torch.allclose(left, right, atol=1e-5, rtol=0)
 
 
 def test_update_policy_two_steps_matches_manual_path():

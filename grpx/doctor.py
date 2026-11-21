@@ -37,6 +37,8 @@ LOW_STEP_SIGNAL_COVERAGE = 0.05                    # 开了 GiGPO 但几乎没�
 # 超长行丢弃比例：预算设太小时会静默丢掉大量数据，训练看似在跑却几乎没学
 OVERSIZED_ROW_WARN_FRACTION = 0.05
 OVERSIZED_ROW_FAIL_FRACTION = 0.20
+# 开了梯度检查点但峰值几乎没降：多半是评测模式下检查点没生效
+CHECKPOINTING_MIN_SAVINGS_BYTES = 1 << 20
 
 
 @dataclass
@@ -302,19 +304,29 @@ def judge_sampling(trajectories, kept, max_new_tokens, truncated_reward=0.0, sto
     return results
 
 
-def judge_oversized_row_fraction(trajectories, max_tokens, merge_append_only=False):
-    """组批前会丢掉长度 > max_tokens 的行；比例过高说明预算设小了，训练几乎没在学。"""
+def oversized_row_stats(trajectories, max_tokens, merge_append_only=False):
+    """返回 (oversized_count, total_rows, fraction, longest_oversized)。"""
     from grpx.loop import row_length
     from grpx.trainer import prepare_update_units
 
     rows = prepare_update_units(trajectories, merge_append_only=merge_append_only)
     if not rows:
-        return CheckResult("采样", "超长行丢弃比例", PASS, "没有更新单元")
-    oversized = sum(1 for row in rows if row_length(row) > max_tokens)
+        return 0, 0, 0.0, 0
+    lengths = [row_length(row) for row in rows]
+    oversized_lengths = [length for length in lengths if length > max_tokens]
     total = len(rows)
-    fraction = oversized / total
+    oversized = len(oversized_lengths)
+    longest = max(oversized_lengths, default=0)
+    return oversized, total, oversized / total, longest
+
+
+def judge_oversized_row_fraction(trajectories, max_tokens, merge_append_only=False):
+    """组批前会丢掉长度 > max_tokens 的行；比例过高说明预算设太小，训练看似在跑却几乎没学。"""
+    oversized, total, fraction, longest = oversized_row_stats(
+        trajectories, max_tokens, merge_append_only=merge_append_only)
+    if total == 0:
+        return CheckResult("采样", "超长行丢弃比例", PASS, "没有更新单元")
     percent = 100.0 * fraction
-    longest = max((row_length(row) for row in rows if row_length(row) > max_tokens), default=0)
     detail = (
         f"{percent:.0f}%（{oversized}/{total}）超过 max_tokens_per_minibatch={max_tokens}"
         + (f"，最长 {longest}" if oversized else "")
@@ -410,8 +422,58 @@ def judge_first_step_ratio(max_ratio_deviation):
     detail = f"首步 |ratio - 1| 最大 {max_ratio_deviation:.2e}"
     if max_ratio_deviation > HIGH_FIRST_STEP_RATIO_DEVIATION:
         return CheckResult("训推一致", "首步 ratio", WARNING, f"{detail}；参数还没更新，ratio 应恰好为 1",
-                           "训练模式和评估模式的前向不同：检查 lora_dropout、模型的 attention_dropout")
+                           "训练模式和评估模式的前向不同：检查 lora_dropout、模型的 attention_dropout，"
+                           "以及 MoE 在训练模式下给路由加的噪声")
     return CheckResult("训推一致", "首步 ratio", PASS, detail)
+
+
+def judge_backend_log_probability_gap(gap_metrics):
+    """采样时服务端 logprob 与训练端重算之差。
+
+    硬失败看尾部大偏差（|Δ|>0.5 的比例 / 最大差）；p95 过高只警告，
+    因为高熵任务上正常也可到 0.04–0.05。
+    """
+    from grpx.loop import (
+        BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT,
+        BACKEND_LOGPROB_GAP_MAX_LIMIT,
+        BACKEND_LOGPROB_GAP_P95_WARN,
+        backend_log_probability_gap_is_hard_failure,
+    )
+    if not gap_metrics:
+        return CheckResult(
+            "训推一致", "采样对数概率差", WARNING, "没有可比对的采样对数概率",
+            "本地后端或未返回 logprob 时会跳过；用 vLLM 后端时可看到这项")
+    p95 = gap_metrics.get("backend_log_probability_gap_p95")
+    median = gap_metrics.get("backend_log_probability_gap_median")
+    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    gap_max = gap_metrics.get("backend_log_probability_gap_max")
+    if p95 is None and above is None and gap_max is None:
+        return CheckResult(
+            "训推一致", "采样对数概率差", WARNING, "没有可比对的采样对数概率",
+            "确认推理服务返回了 token logprobs")
+    parts = []
+    if above is not None:
+        parts.append(f"|Δ|>0.5 比例 {above:.2e}")
+    if gap_max is not None:
+        parts.append(f"最大 {gap_max:.2e}")
+    if p95 is not None:
+        parts.append(f"p95 {p95:.2e}")
+    if median is not None:
+        parts.append(f"中位数 {median:.2e}")
+    detail = "，".join(parts)
+    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+        return CheckResult(
+            "训推一致", "采样对数概率差", FAIL,
+            f"{detail}；尾部大偏差超过阈值"
+            f"（比例>{BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT:g} 或 最大>{BACKEND_LOGPROB_GAP_MAX_LIMIT:g}）",
+            "训练端和推理端不是同一份有效模型：检查基座路径、分词器、对话模板，"
+            "以及合并模型 config.json 是否仍有顶层 rope_theta（transformers 5.x 可能只写在 rope_parameters 里）")
+    if p95 is not None and p95 > BACKEND_LOGPROB_GAP_P95_WARN:
+        return CheckResult(
+            "训推一致", "采样对数概率差", WARNING,
+            f"{detail}；p95 超过 {BACKEND_LOGPROB_GAP_P95_WARN:g}",
+            "高熵任务下可能是正常噪声；若同时出现差超过 0.5 的 token，再按配置错位排查")
+    return CheckResult("训推一致", "采样对数概率差", PASS, detail)
 
 
 def judge_shift(shift, learning_rate, mixed_precision=False):
@@ -455,6 +517,23 @@ def judge_routing(shift, routing_available):
         f"负载归一化熵 {load_entropy:.3f}"
     )
     return CheckResult("试更新", "路由", PASS, detail)
+
+
+def judge_gradient_checkpointing_effect(peak_without, peak_with):
+    """开和关各摸一次最坏小批。没有下降就警告：检查点可能没生效。peak_without 为 None 表示关闭时已经显存不足。"""
+    if peak_without is None:
+        return CheckResult(
+            "试更新", "梯度检查点", PASS,
+            f"关闭时显存不足，打开后峰值 {peak_with / 2 ** 30:.2f} GB")
+    delta = peak_without - peak_with
+    detail = (f"关 {peak_without / 2 ** 30:.2f} GB，开 {peak_with / 2 ** 30:.2f} GB，"
+              f"差值 {delta / 2 ** 30:.2f} GB")
+    if delta < CHECKPOINTING_MIN_SAVINGS_BYTES:
+        return CheckResult(
+            "试更新", "梯度检查点", WARNING,
+            f"{detail}；打开后峰值没有下降，检查点可能没生效",
+            "带梯度的前向必须处于训练模式；确认模型支持梯度检查点")
+    return CheckResult("试更新", "梯度检查点", PASS, detail)
 
 
 def judge_memory(peak_by_phase, total, memory_fraction=None):
@@ -701,8 +780,9 @@ def enumerate_worst_case_specs(prompt_length, max_new_tokens, max_rows, max_toke
                                max_steps=1, merge_append_only=False, tokens_per_step=None):
     """按行数枚举可行形状。
 
-    对每个行数，行长取 min(完整最坏长度, 预算 // 行数)，这样会摸到「用满 token 预算」的批；
-    完整最坏长度超过预算时，另加一条单行超长形状（训练里也会单独成批/被筛掉前的峰值）。
+    对每个行数，行长取 min(完整最坏长度, 预算 // 行数)，这样会摸到「用满 token 预算」的批。
+    完整最坏长度超过预算时不再摸未截断整行：训练会丢弃超预算行，探针只测训练实际会处理的长度。
+    当步数 > max_rows 导致上面循环为空时，仍探一条行长封顶为预算的单行（对应合并后的满步轨迹）。
     """
     step_options = range(1, max_steps + 1) if (merge_append_only and max_steps > 1) else (1,)
     specs = []
@@ -736,13 +816,41 @@ def enumerate_worst_case_specs(prompt_length, max_new_tokens, max_rows, max_toke
             # 用满预算：多行时行长可以短于完整最坏长度
             capped = min(full_length, max_tokens // row_count)
             add_spec(steps_per_unit, row_count, capped)
-        if full_length > max_tokens:
-            # 超预算单独成批的长对话：即使用 min 截断后仍要摸这条
-            add_spec(steps_per_unit, 1, full_length)
+        if max_rows_for_steps < 1:
+            # 步数超过「段数预算」时仍摸单行，长度封在 token 预算内
+            add_spec(steps_per_unit, 1, min(full_length, max_tokens))
     if not specs:
-        row_length = worst_case_row_length(prompt_length, max_new_tokens, 1, tokens_per_step)
+        row_length = min(
+            worst_case_row_length(prompt_length, max_new_tokens, 1, tokens_per_step),
+            max_tokens,
+        )
         add_spec(1, 1, row_length)
     return specs
+
+
+def judge_worst_case_exceeds_token_budget(
+    formula_worst_length, max_tokens, oversized_fraction=None, oversized_count=None, oversized_total=None,
+):
+    """公式最坏行长超过小批预算：满长局会被丢弃；不据此判失败（显存摸底已按预算封顶）。"""
+    if formula_worst_length <= max_tokens:
+        return CheckResult(
+            "采样", "最坏行长与预算", PASS,
+            f"公式最坏行长 {formula_worst_length} ≤ max_tokens_per_minibatch={max_tokens}")
+    detail = (
+        f"公式最坏行长 {formula_worst_length} > max_tokens_per_minibatch={max_tokens}；"
+        "满长的局会被丢弃，显存摸底按预算封顶"
+    )
+    if oversized_fraction is not None and oversized_total:
+        detail += (
+            f"；本轮采样丢弃 {oversized_count}/{oversized_total}"
+            f"（{100.0 * oversized_fraction:.1f}%）"
+        )
+    elif oversized_fraction is not None:
+        detail += f"；本轮采样丢弃比例 {100.0 * oversized_fraction:.1f}%"
+    return CheckResult(
+        "采样", "最坏行长与预算", WARNING, detail,
+        "丢弃比例持续偏高时降低 max_new_tokens / max_steps，或增大 max_tokens_per_minibatch；"
+        "训练中盯 oversized_row_count")
 
 
 def select_worst_case_probe_targets(specs):
@@ -949,22 +1057,26 @@ def probe_worst_case_shapes(model, prompt_token_ids, max_new_tokens, config, pad
 
 
 def run_worst_case_update_probe(model, batch, config):
-    """对最坏小批做一次带梯度的前向+反向，用于显存摸底。"""
+    """对最坏小批做一次带梯度的前向+反向，用于显存摸底。
+
+    走和训练一样的模式切换：检查点只在训练模式生效，反向重算结束才恢复原模式。
+    """
+    from grpx.gradient_checkpointing import gradient_bearing_forward
     from grpx.loop import loss_options
     from grpx.trainer import action_log_probabilities, grpo_loss
 
-    model.train()
-    model.zero_grad(set_to_none=True)
-    log_probabilities, mask = action_log_probabilities(model, batch)
-    loss, metrics = grpo_loss(
-        log_probabilities, log_probabilities.detach(), mask, batch["advantages"],
-        row_weights=batch.get("row_weights"),
-        segment_ids=batch.get("segment_ids"),
-        segment_advantages=batch.get("segment_advantages"),
-        segment_weights=batch.get("segment_weights"),
-        **loss_options(config),
-    )
-    loss.backward()
+    with gradient_bearing_forward(model):
+        model.zero_grad(set_to_none=True)
+        log_probabilities, mask = action_log_probabilities(model, batch)
+        loss, metrics = grpo_loss(
+            log_probabilities, log_probabilities.detach(), mask, batch["advantages"],
+            row_weights=batch.get("row_weights"),
+            segment_ids=batch.get("segment_ids"),
+            segment_advantages=batch.get("segment_advantages"),
+            segment_weights=batch.get("segment_weights"),
+            **loss_options(config),
+        )
+        loss.backward()
     return metrics
 
 
@@ -1262,6 +1374,9 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
     report.add(*judge_sampling(
         trajectories, kept, backend.max_new_tokens, truncated_reward=config.truncated_reward,
         stop_strings=getattr(backend, "stop_strings", ())))
+    oversized_count, oversized_total, oversized_fraction, _longest = oversized_row_stats(
+        trajectories, config.max_tokens_per_minibatch,
+        merge_append_only=config.merge_append_only_turns)
     report.add(judge_oversized_row_fraction(
         trajectories, config.max_tokens_per_minibatch,
         merge_append_only=config.merge_append_only_turns))
@@ -1292,16 +1407,60 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
                 parameter.copy_(snapshot[name])
 
     # 最坏小批：按行数枚举，摸总面积最大与回答位最多两个形状，取峰值更大者；
-    # 步间增量用采样里相邻提示长度差的最大值（含环境反馈）
+    # 步间增量用采样里相邻提示长度差的最大值（含环境反馈）；行长封顶为 token 预算
     report.output("最坏小批显存摸底（按行数枚举；面积最大 / 回答位最多）……")
     try:
         prompt_token_ids = longest_first_prompt_token_ids(
             tokenizer, environment_factory, train_dataset)
         tokens_per_step = max_prompt_growth_tokens(trajectories, minimum=backend.max_new_tokens)
-        best, details = probe_worst_case_shapes(
-            model, prompt_token_ids, backend.max_new_tokens, config, padding_token_id,
-            model.device, backend.temperature, restore_trainable,
-            tokens_per_step=tokens_per_step)
+        formula_worst = worst_case_row_length(
+            len(prompt_token_ids), backend.max_new_tokens, config.max_steps, tokens_per_step)
+        report.add(judge_worst_case_exceeds_token_budget(
+            formula_worst, config.max_tokens_per_minibatch,
+            oversized_fraction=oversized_fraction,
+            oversized_count=oversized_count,
+            oversized_total=oversized_total,
+        ))
+        def run_probe():
+            return probe_worst_case_shapes(
+                model, prompt_token_ids, backend.max_new_tokens, config, padding_token_id,
+                model.device, backend.temperature, restore_trainable,
+                tokens_per_step=tokens_per_step)
+
+        if config.gradient_checkpointing:
+            from grpx.gradient_checkpointing import gradient_checkpointing
+            try:
+                gradient_checkpointing(model, True)
+            except ValueError as error:
+                report.add(CheckResult(
+                    "试更新", "梯度检查点", FAIL, str(error),
+                    "关掉 training.gradient_checkpointing，或换用支持该功能的模型"))
+                restore_trainable()
+                return
+            if use_cuda:
+                gradient_checkpointing(model, False)
+                torch.cuda.empty_cache()
+                peak_off = None
+                try:
+                    best_off, _ = run_probe()
+                    peak_off = best_off["peak_bytes"]
+                except Exception as error:    # noqa: BLE001
+                    if not is_out_of_memory(error):
+                        raise
+                    report.output("关闭梯度检查点时最坏小批显存不足，继续测打开后的峰值")
+                restore_trainable()
+                torch.cuda.empty_cache()
+                gradient_checkpointing(model, True)
+            best, details = run_probe()
+            if use_cuda:
+                report.add(judge_gradient_checkpointing_effect(peak_off, best["peak_bytes"]))
+            else:
+                report.add(CheckResult(
+                    "试更新", "梯度检查点", WARNING,
+                    "当前不是 CUDA，无法比较开和关的显存峰值",
+                    "在训练显卡上重跑预检，确认打开后峰值下降"))
+        else:
+            best, details = run_probe()
         peak_by_phase["最坏小批"] = best["peak_bytes"]
         shape_summary = "；".join(
             f"{item['shape']} {item['unit_count']}行×{item['segments']}段×长{item['row_length']}"
@@ -1326,7 +1485,6 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
         raise
     finally:
         restore_trainable()
-
     update_seconds = 0.0
     if not kept:
         report.add(CheckResult("试更新", "跳过", WARNING, "这一轮没有有信号的组，无法试更新",
@@ -1337,7 +1495,12 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
             torch.cuda.reset_peak_memory_stats(cuda_device)
         start = time.perf_counter()
         try:
-            (history, batches, old_log_probabilities, _gap_metrics, _merge_fraction,
+            # 首步 ratio 从这次更新里来：旧概率在评测模式，新概率走 gradient_bearing_forward。
+            # 检查点必须在这之前开着，lora_dropout 或路由噪声才会在这一项上露出来。
+            if config.gradient_checkpointing:
+                from grpx.gradient_checkpointing import gradient_checkpointing
+                gradient_checkpointing(model, True)
+            (history, batches, old_log_probabilities, gap_metrics, _merge_fraction,
              peak_batch, _oversized, routing_before) = update_policy(
                 model, optimizer, kept, padding_token_id, config, record_routing=True)
             if not history:
@@ -1366,6 +1529,7 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
         if use_cuda:
             peak_by_phase["更新"] = torch.cuda.max_memory_allocated(cuda_device)
         report.add(judge_first_step_ratio(history[0]["max_ratio_deviation"]))
+        report.add(judge_backend_log_probability_gap(gap_metrics))
         report.add(judge_shift(
             shift, config.learning_rate,
             mixed_precision=bool(getattr(model, "grpx_mixed_precision", False))))

@@ -40,6 +40,12 @@ class TrainingConfig:
     run_name: str | None = None
     evaluation_interval: int = 10
     checkpoint_interval: int = 5
+    # 带梯度的前向重算激活，降低显存；评测模式不会生效。默认关
+    gradient_checkpointing: bool = False
+    # 采样后把本轮轨迹和小批划分写盘；恢复且校验通过时跳过采样
+    save_iteration_trajectories: bool = False
+    # 每累积多少个小批保存一次梯度；0 表示不保存。大于 0 时必须同时保存轨迹
+    accumulation_checkpoint_interval: int = 0
     # 每隔多少轮测一次位移；0 表示不测。第 0 轮在 interval>0 时总会测（与评测间隔同一写法）
     shift_measurement_interval: int = 1
     max_steps: int = 6
@@ -78,6 +84,22 @@ class TrainingConfig:
             raise ValueError(f"row_weighting 只能是 'per_step' 或 'per_trajectory'，收到 {self.row_weighting!r}")
         if not isinstance(self.merge_append_only_turns, bool):
             raise ValueError(f"merge_append_only_turns 必须是布尔值，收到 {self.merge_append_only_turns!r}")
+        if not isinstance(self.gradient_checkpointing, bool):
+            raise ValueError(
+                f"gradient_checkpointing 必须是布尔值，收到 {self.gradient_checkpointing!r}")
+        if not isinstance(self.save_iteration_trajectories, bool):
+            raise ValueError(
+                f"save_iteration_trajectories 必须是布尔值，收到 {self.save_iteration_trajectories!r}")
+        if (isinstance(self.accumulation_checkpoint_interval, bool)
+                or not isinstance(self.accumulation_checkpoint_interval, int)
+                or self.accumulation_checkpoint_interval < 0):
+            raise ValueError(
+                "accumulation_checkpoint_interval 必须是非负整数，"
+                f"收到 {self.accumulation_checkpoint_interval!r}")
+        if self.accumulation_checkpoint_interval > 0 and not self.save_iteration_trajectories:
+            raise ValueError(
+                "accumulation_checkpoint_interval > 0 时必须打开 save_iteration_trajectories，"
+                "否则恢复后会重新采样，累积到一半的梯度对不上")
         if not self.learning_rate > 0:
             raise ValueError(f"learning_rate 必须大于 0，收到 {self.learning_rate!r}")
         if self.learning_rate_schedule not in ("constant", "cosine"):

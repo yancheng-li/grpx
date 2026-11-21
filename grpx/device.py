@@ -34,10 +34,10 @@ def cuda_device_ordinal(device):
 
 
 def indexed_cuda_device(device):
-    """torch.cuda.* 部分接口不接受无 index 的 'cuda'，收成 cuda:N。"""
+    """torch.cuda.* 部分接口不接受无 index 的 'cuda'，收成 cuda:N。没有 CUDA 时返回 None。"""
     import torch
 
-    if not is_cuda_device(device):
+    if not torch.cuda.is_available() or not is_cuda_device(device):
         return None
     resolved = torch.device(device)
     if resolved.index is not None:

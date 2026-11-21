@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import shutil
 
 import torch
@@ -60,6 +61,28 @@ def save_checkpoint(run_directory, completed_iterations, model, optimizer, sched
         shutil.rmtree(final_directory)
     os.replace(partial_directory, final_directory)   # 写完整了才改成正式名字
     return final_directory
+
+
+def prune_rolling_checkpoints(run_directory, keep_completed, interval, total_iterations):
+    """轨迹保存打开时，间隔之外只留最新一份检查点。
+
+    间隔边界和最后一轮仍全部保留。这样中断时加载到的权重就是正在进行的那一轮开头，
+    轨迹和累积梯度的校验才对得上。
+    """
+    for directory in pathlib.Path(run_directory).glob("checkpoint-*"):
+        if not directory.is_dir() or directory.name.endswith(".partial"):
+            continue
+        if not (directory / "training_state.pt").is_file():
+            continue
+        suffix = directory.name[len("checkpoint-"):]
+        if not suffix.isdigit():
+            continue
+        completed = int(suffix)
+        if completed == keep_completed:
+            continue
+        if completed % interval == 0 or completed == total_iterations:
+            continue
+        shutil.rmtree(directory)
 
 
 def find_latest_checkpoint(run_directory):

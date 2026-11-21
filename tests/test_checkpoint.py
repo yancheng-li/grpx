@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from grpx.checkpoint import (find_latest_checkpoint, load_checkpoint, save_checkpoint,
-                              truncate_metrics)
+from grpx.checkpoint import (find_latest_checkpoint, load_checkpoint, prune_rolling_checkpoints,
+                              save_checkpoint, truncate_metrics)
 from grpx.command_line import ConfigurationError, load_resume_configuration
 from grpx.config import TrainingConfig
 from grpx.environment import SingleTurnEnvironment
@@ -349,3 +349,204 @@ def test_resume_rejects_disallowed_overrides(tmp_path):
     assert updated["training"]["max_rows_per_minibatch"] == 4
     assert updated["training"]["shift_measurement_interval"] == 5
     assert updated["backend"]["max_rows_per_batch"] == 8
+
+
+class CountingBackend(DeterministicBackend):
+    def __init__(self):
+        self.generate_calls = 0
+        self.sync_calls = 0
+
+    def generate_batch(self, requests, greedy=False):
+        self.generate_calls += 1
+        return super().generate_batch(requests, greedy=greedy)
+
+    def synchronize_policy(self, model):
+        self.sync_calls += 1
+
+
+def test_resume_skips_saved_sampling_and_still_synchronizes(tmp_path, monkeypatch):
+    """采样落盘后在更新时中断：恢复跳过采样，更新后的同步照常做，参数与不中断的一轮相同。"""
+    import grpx.loop as loop_module
+
+    def run(name, iterations, resume_from=None, backend=None):
+        torch.manual_seed(0)
+        model = TinyLanguageModel()
+        if resume_from is not None:
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.mul_(0.0).add_(1.0)
+        config = TrainingConfig(
+            iterations=iterations, groups_per_iteration=2, group_size=2,
+            max_rows_per_minibatch=4, max_tokens_per_minibatch=10**6,
+            warmup_iterations=2, checkpoint_interval=1,
+            evaluation_interval=10, shift_measurement_interval=0,
+            max_steps=1, seed=0, output_root=str(tmp_path), run_name=name,
+            save_iteration_trajectories=True,
+        )
+        dataset = [{"prompt": f"q{index}", "answer": index} for index in range(20)]
+        if backend is None:
+            backend = DeterministicBackend()
+        directory = train(
+            model, FakeTokenizer(), backend, dataset,
+            lambda: SingleTurnEnvironment(reward_from_action), config,
+            resume_from=resume_from)
+        return directory, model, backend
+
+    uninterrupted_directory, uninterrupted_model, _ = run("uninterrupted", 2)
+    real_update = loop_module.update_policy
+
+    def crash_on_iteration_1(*args, **kwargs):
+        if kwargs.get("iteration") == 1:
+            raise RuntimeError("interrupt update")
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(loop_module, "update_policy", crash_on_iteration_1)
+    with pytest.raises(RuntimeError, match="interrupt update"):
+        run("resumed", 2)
+    crashed = tmp_path / "resumed"
+    assert (crashed / "checkpoint-0001").is_dir()
+    assert (crashed / "iteration_trajectories" / "iteration-0001.pt").is_file()
+
+    monkeypatch.setattr(loop_module, "update_policy", real_update)
+    backend = CountingBackend()
+    resumed_directory, resumed_model, _ = run("resumed", 2, resume_from=crashed, backend=backend)
+    assert resumed_directory == crashed
+    assert backend.generate_calls == 0
+    assert backend.sync_calls == 2
+    for left, right in zip(uninterrupted_model.parameters(), resumed_model.parameters()):
+        assert torch.equal(left, right)
+
+
+def test_prune_keeps_interval_boundaries_and_the_latest(tmp_path):
+    model = RecordingModel()
+    optimizer, scheduler = make_optimizer_and_scheduler(model)
+    random_generator = random.Random(0)
+    for completed in (2, 4, 5):
+        save_checkpoint(tmp_path, completed, model, optimizer, scheduler, random_generator)
+    partial = tmp_path / "checkpoint-0003.partial"
+    partial.mkdir()
+    (partial / "training_state.pt").write_bytes(b"incomplete")
+    prune_rolling_checkpoints(tmp_path, keep_completed=5, interval=2, total_iterations=10)
+    names = sorted(path.name for path in tmp_path.iterdir())
+    assert names == ["checkpoint-0002", "checkpoint-0003.partial", "checkpoint-0004", "checkpoint-0005"]
+
+
+class LogprobBackend(DeterministicBackend):
+    """对数概率按当前权重算，和训练端的旧策略概率一致，否则首轮的训推差会直接中断。"""
+
+    def __init__(self):
+        self.generate_calls = 0
+        self.sync_calls = 0
+        self.model = None
+
+    def synchronize_policy(self, model):
+        self.model = model
+        self.sync_calls += 1
+
+    def _token_logprobs(self, prompt_token_ids, action_token_ids):
+        tokens = list(prompt_token_ids) + list(action_token_ids)
+        input_ids = torch.tensor([tokens], device=self.model.device)
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(input_ids).logits[0]
+            start = len(prompt_token_ids) - 1
+            chosen_logits = logits[start:start + len(action_token_ids)].float()
+            log_probs = torch.log_softmax(chosen_logits, dim=-1)
+            chosen = log_probs[range(len(action_token_ids)), list(action_token_ids)]
+        self.model.train(was_training)
+        return [float(value) for value in chosen]
+
+    def generate_batch(self, requests, greedy=False):
+        self.generate_calls += 1
+        groups = []
+        for request in requests:
+            prompt_token_ids, count = request[0], request[1]
+            group = []
+            for _ in range(count):
+                token = int(torch.randint(1, 10, (1,)).item())
+                group.append(([token], False, self._token_logprobs(prompt_token_ids, [token])))
+            groups.append(group)
+        return groups
+
+
+def _metrics_by_iteration(run_directory):
+    records = {}
+    for line in (run_directory / "metrics.jsonl").read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            record = json.loads(line)
+            records[record["iteration"]] = record
+    return records
+
+
+def test_rolling_checkpoint_resumes_mid_interval_and_keeps_sampling_fields(tmp_path, monkeypatch):
+    """间隔是 10 时，第 3 轮开头的权重仍在盘上。跳过采样后，成功率、有信号比例和对数概率差与不中断相同。"""
+    import grpx.loop as loop_module
+
+    def success(action, sample):
+        return int(action) % 2 == 0
+
+    def reward(prompt, completion, sample):
+        return float(completion)
+
+    def run(name, iterations, resume_from=None, backend=None):
+        torch.manual_seed(0)
+        model = TinyLanguageModel()
+        if resume_from is not None:
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.mul_(0.0).add_(1.0)
+        config = TrainingConfig(
+            iterations=iterations, groups_per_iteration=4, group_size=4,
+            max_rows_per_minibatch=8, max_tokens_per_minibatch=10**6,
+            warmup_iterations=2, checkpoint_interval=10,
+            evaluation_interval=10, shift_measurement_interval=0,
+            max_steps=1, seed=0, output_root=str(tmp_path), run_name=name,
+            save_iteration_trajectories=True,
+        )
+        dataset = [{"prompt": f"q{index}", "answer": index} for index in range(20)]
+        if backend is None:
+            backend = LogprobBackend()
+        directory = train(
+            model, FakeTokenizer(), backend, dataset,
+            lambda: SingleTurnEnvironment(reward, success_function=success),
+            config, resume_from=resume_from)
+        return directory, model, backend
+
+    uninterrupted_directory, uninterrupted_model, _ = run("rolling-full", 3)
+    assert find_latest_checkpoint(uninterrupted_directory).name == "checkpoint-0003"
+    assert not (uninterrupted_directory / "checkpoint-0001").exists()
+    assert not (uninterrupted_directory / "checkpoint-0002").exists()
+    full_metrics = _metrics_by_iteration(uninterrupted_directory)
+    assert full_metrics[2]["signal_fraction"] > 0
+    assert "success_fraction" in full_metrics[2]
+    assert "backend_log_probability_gap_median" in full_metrics[2]
+
+    real_update = loop_module.update_policy
+
+    def crash_on_iteration_2(*args, **kwargs):
+        if kwargs.get("iteration") == 2:
+            raise RuntimeError("interrupt update")
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(loop_module, "update_policy", crash_on_iteration_2)
+    with pytest.raises(RuntimeError, match="interrupt update"):
+        run("rolling-crash", 3)
+    crashed = tmp_path / "rolling-crash"
+    assert (crashed / "checkpoint-0002").is_dir()
+    assert not (crashed / "checkpoint-0001").exists()
+    assert (crashed / "iteration_trajectories" / "iteration-0002.pt").is_file()
+
+    monkeypatch.setattr(loop_module, "update_policy", real_update)
+    backend = LogprobBackend()
+    resumed_directory, resumed_model, _ = run(
+        "rolling-crash", 3, resume_from=crashed, backend=backend)
+    assert backend.generate_calls == 0
+    assert backend.sync_calls == 2
+    for left, right in zip(uninterrupted_model.parameters(), resumed_model.parameters()):
+        assert torch.equal(left, right)
+    resumed_metrics = _metrics_by_iteration(resumed_directory)[2]
+    for name in ("success_fraction", "signal_fraction",
+                 "backend_log_probability_gap_median", "backend_log_probability_gap_p95",
+                 "backend_log_probability_gap_max"):
+        assert resumed_metrics[name] == full_metrics[2][name]

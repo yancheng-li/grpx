@@ -4,8 +4,10 @@ from examples.guess_number import GuessNumberEnvironment, make_dataset
 from grpx.config import TrainingConfig
 from grpx.doctor import (FAIL, PASS, WARNING, CheckResult, Report, build_worst_case_batch,
                          enumerate_worst_case_specs, estimate_duration, is_out_of_memory,
-                         judge_dataset, judge_first_step_ratio, judge_log_probabilities,
-                         judge_memory, judge_package_version, judge_sampling, judge_shift,
+                         judge_backend_log_probability_gap, judge_dataset,
+                         judge_first_step_ratio, judge_log_probabilities,
+                         judge_gradient_checkpointing_effect, judge_memory,
+                         judge_package_version, judge_sampling, judge_shift,
                          judge_step_signal_coverage,                          judge_oversized_row_fraction, judge_truncated_beats_normal,
                          judge_truncated_high_reward, select_worst_case_probe_targets,
                          walk_through_environment)
@@ -229,6 +231,48 @@ def test_first_step_ratio_judgement():
     assert judge_first_step_ratio(0.0).status == PASS
     assert judge_first_step_ratio(0.05).status == WARNING
 
+
+def test_backend_log_probability_gap_uses_tail():
+    assert judge_backend_log_probability_gap({}).status == WARNING
+    assert judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 1e-7,
+        "backend_log_probability_gap_p95": 5e-4,
+        "backend_log_probability_gap_above_half_fraction": 0.0,
+        "backend_log_probability_gap_max": 0.12,
+    }).status == PASS
+    # 高熵任务：p95 偏高但无尾部大偏差 → 只警告
+    warned = judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 1e-3,
+        "backend_log_probability_gap_p95": 0.05,
+        "backend_log_probability_gap_above_half_fraction": 0.0,
+        "backend_log_probability_gap_max": 0.24,
+    })
+    assert warned.status == WARNING
+    assert "高熵" in warned.suggestion
+    # 孤立大偏差：max 略高于旧阈值 1，但远低于新阈值 5，且比例正常 → 通过
+    assert judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 1e-7,
+        "backend_log_probability_gap_p95": 1e-5,
+        "backend_log_probability_gap_above_half_fraction": 1.1e-4,
+        "backend_log_probability_gap_max": 1.03,
+    }).status == PASS
+    # 配置错位：尾部大偏差（比例超标）
+    failed = judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 1e-7,
+        "backend_log_probability_gap_p95": 0.05,
+        "backend_log_probability_gap_above_half_fraction": 0.02,
+        "backend_log_probability_gap_max": 8.0,
+    })
+    assert failed.status == FAIL
+    assert "rope_theta" in failed.suggestion
+    # 配置错位：单点 max 也到了错位量级
+    assert judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 1e-7,
+        "backend_log_probability_gap_p95": 1e-4,
+        "backend_log_probability_gap_above_half_fraction": 0.0,
+        "backend_log_probability_gap_max": 5.1,
+    }).status == FAIL
+
 def shift(median, percentile_95, clip_fraction):
     return {"shift_median_absolute_log_ratio": median, "shift_percentile_95_absolute_log_ratio": percentile_95,
             "shift_clip_fraction": clip_fraction}
@@ -246,6 +290,17 @@ def test_shift_judgement():
     assert judge_shift(shift(4e-3, 0.09, 0.0), 1e-5, mixed_precision=True).status == PASS
     assert judge_shift(shift(5e-2, 0.9, 0.35), 1e-3, mixed_precision=True).status == WARNING
     assert judge_shift(shift(0.0, 0.0, 0.0), 1e-5, mixed_precision=True).status == FAIL
+
+def test_gradient_checkpointing_effect_warns_when_peak_does_not_drop():
+    gigabyte = 2 ** 30
+    assert judge_gradient_checkpointing_effect(8 * gigabyte, 5 * gigabyte).status == PASS
+    assert judge_gradient_checkpointing_effect(None, 5 * gigabyte).status == PASS
+    unchanged = judge_gradient_checkpointing_effect(8 * gigabyte, 8 * gigabyte)
+    assert unchanged.status == WARNING
+    assert "没有下降" in unchanged.detail
+    higher = judge_gradient_checkpointing_effect(8 * gigabyte, 8 * gigabyte + 4096)
+    assert higher.status == WARNING
+
 
 def test_memory_judgement():
     from grpx.loop import TRAINING_MEMORY_FRACTION
@@ -283,7 +338,7 @@ def test_worst_case_batch_fills_token_budget():
         [1] * 20, max_new_tokens=20, max_rows=8, max_tokens=30,
         padding_token_id=0, device="cpu",
     )
-    assert alone_count == 1 and alone_length == 40 and alone_steps == 1
+    assert alone_count == 1 and alone_length == 30 and alone_steps == 1
     assert alone["input_token_ids"].shape[0] == 1
 
 
@@ -389,14 +444,39 @@ def test_select_worst_case_probes_area_and_answer_extrema():
         assert len(targets) == 2
 
 
-def test_oversized_single_row_is_still_enumerated():
+def test_oversized_row_is_capped_at_token_budget_not_probed_uncapped():
+    # 完整最坏 40 > 预算 30：只摸封顶后的形状，不再摸未截断的 40
     specs = enumerate_worst_case_specs(
         prompt_length=20, max_new_tokens=20, max_rows=8, max_tokens=30,
         max_steps=1, merge_append_only=False,
     )
-    assert any(spec.row_count == 1 and spec.row_length == 40 and spec.area == 40 for spec in specs)
+    assert all(spec.row_length <= 30 for spec in specs)
+    assert not any(spec.row_length == 40 for spec in specs)
+    assert any(spec.row_count == 1 and spec.row_length == 30 for spec in specs)
     # 用满预算时也可能有短行多行形状（行长 = min(40, 30//n)）
     assert any(spec.row_count > 1 and spec.area <= 30 for spec in specs)
+
+
+def test_merge_steps_beyond_row_budget_still_gets_capped_single_row():
+    # max_rows=8、max_steps=10 → 10 步时 8//10=0，仍应有封顶单行
+    specs = enumerate_worst_case_specs(
+        prompt_length=199, max_new_tokens=288, max_rows=8, max_tokens=3072,
+        max_steps=10, merge_append_only=True, tokens_per_step=288,
+    )
+    ten = [spec for spec in specs if spec.steps_per_unit == 10]
+    assert ten and ten[0].row_count == 1 and ten[0].row_length == 3072
+    assert all(spec.row_length <= 3072 for spec in specs)
+
+
+def test_worst_case_exceeds_budget_warns_with_drop_stats():
+    from grpx.doctor import judge_worst_case_exceeds_token_budget
+    ok = judge_worst_case_exceeds_token_budget(3000, 3072)
+    assert ok.status == PASS
+    warn = judge_worst_case_exceeds_token_budget(
+        3400, 3072, oversized_fraction=0.0, oversized_count=0, oversized_total=173)
+    assert warn.status == WARNING
+    assert "满长的局会被丢弃" in warn.detail
+    assert "0/173" in warn.detail
 
 
 def test_enumerate_caps_row_length_by_token_budget_per_row():

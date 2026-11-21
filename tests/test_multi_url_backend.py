@@ -165,9 +165,12 @@ def test_gap_metrics_take_max_across_urls_and_name_worst():
         }, torch.tensor([[train_logp, train_logp]])
 
     batch_a, old_a = batch_for("http://a", 0.0, 0.01)
-    batch_b, old_b = batch_for("http://b", 0.0, 0.40)
+    # url b：差 2.0 → 尾部大偏差，应判为最差地址并硬失败
+    batch_b, old_b = batch_for("http://b", 0.0, 2.0)
     metrics = measure_backend_log_probability_gap([batch_a, batch_b], [old_a, old_b])
-    assert metrics["backend_log_probability_gap_median"] == pytest.approx(0.40)
+    assert metrics["backend_log_probability_gap_median"] == pytest.approx(2.0)
+    assert metrics["backend_log_probability_gap_max"] == pytest.approx(2.0)
+    assert metrics["backend_log_probability_gap_above_half_fraction"] == pytest.approx(1.0)
     assert metrics["backend_log_probability_gap_worst_url"] == "http://b"
     assert "gap_by_url" in metrics
     with pytest.raises(RuntimeError, match="http://b"):

@@ -17,6 +17,21 @@ def test_training_config_defaults_and_rejects_bad_memory_fraction():
         TrainingConfig(device="")
 
 
+def test_recovery_flags_default_off_and_accumulation_needs_trajectories():
+    config = TrainingConfig()
+    assert config.gradient_checkpointing is False
+    assert config.save_iteration_trajectories is False
+    assert config.accumulation_checkpoint_interval == 0
+    TrainingConfig(accumulation_checkpoint_interval=0, save_iteration_trajectories=False)
+    TrainingConfig(accumulation_checkpoint_interval=2, save_iteration_trajectories=True)
+    with pytest.raises(ValueError, match="save_iteration_trajectories"):
+        TrainingConfig(accumulation_checkpoint_interval=2)
+    with pytest.raises(ValueError, match="accumulation_checkpoint_interval"):
+        TrainingConfig(accumulation_checkpoint_interval=-1)
+    with pytest.raises(ValueError, match="gradient_checkpointing"):
+        TrainingConfig(gradient_checkpointing="yes")
+
+
 def test_shared_gpu_hint_only_when_fraction_below_threshold():
     assert shared_gpu_memory_hint(0.6) is not None
     assert shared_gpu_memory_hint(0.95) is None
