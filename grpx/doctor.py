@@ -697,6 +697,119 @@ def judge_chat_template(tokenizer):
     return CheckResult("模型", "对话模板", PASS, "tokenizer.chat_template 已设置")
 
 
+def parse_nvidia_smi_vllm_indices(gpu_csv, app_csv):
+    """从 nvidia-smi 的两段 CSV 里找出 vLLM 进程占的卡号。找不到进程时返回空集。"""
+    uuid_to_index = {}
+    for line in gpu_csv.splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        index_text, uuid = [part.strip() for part in line.split(",", 1)]
+        if index_text.isdigit():
+            uuid_to_index[uuid] = int(index_text)
+    indices = set()
+    for line in app_csv.splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        uuid, process_name = [part.strip() for part in line.split(",", 1)]
+        if "vllm" in process_name.lower() and uuid in uuid_to_index:
+            indices.add(uuid_to_index[uuid])
+    return indices
+
+
+def query_vllm_cuda_indices():
+    """看到 vLLM 进程就返回它占的卡号；nvidia-smi 不可用时返回 None。"""
+    import subprocess
+
+    try:
+        gpu = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15, check=False)
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid,process_name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if gpu.returncode != 0:
+        return None
+    return parse_nvidia_smi_vllm_indices(gpu.stdout, apps.stdout or "")
+
+
+def describe_training_devices(device_names, torch_module):
+    from grpx.device import resolve_device
+
+    count = torch_module.cuda.device_count() if torch_module.cuda.is_available() else 0
+    described = []
+    for name in device_names:
+        try:
+            resolved = resolve_device(name)
+        except ValueError as error:
+            described.append({"name": name, "status": "invalid", "detail": str(error)})
+            continue
+        if resolved.type != "cuda":
+            described.append({"name": name, "status": "ok", "key": str(resolved)})
+            continue
+        index = resolved.index
+        if index is None and count:
+            index = torch_module.cuda.current_device()
+        if index is None or index < 0 or index >= count:
+            described.append({"name": name, "status": "missing", "index": index, "count": count})
+        else:
+            described.append({"name": name, "status": "ok", "key": f"cuda:{index}", "index": index})
+    return described
+
+
+def judge_training_devices(described, inference_indices=(), inference_known=True):
+    """设备要存在、物理上不重复。多张训练卡不能和推理服务抢同一张。
+
+    只训练一张卡、推理也在这张卡上，是单卡共用，不算失败。
+    """
+    results = []
+    seen = []
+    for item in described:
+        if item["status"] == "invalid":
+            results.append(CheckResult(
+                "配置", "训练设备", FAIL, item["detail"], "修改 training.device 或 training.devices"))
+            continue
+        if item["status"] == "missing":
+            visible = item["count"]
+            results.append(CheckResult(
+                "配置", "训练设备", FAIL,
+                f"{item['name']} 不存在（当前可见 {visible} 张显卡）",
+                "改成 nvidia-smi 里有的序号"))
+            continue
+        if item["key"] in seen:
+            results.append(CheckResult(
+                "配置", "训练设备", FAIL,
+                f"{item['name']} 和前面的设备是同一张卡",
+                "每张卡只写一次。同一张卡上放两份副本只用于把多卡路径跑通，不要用于正式训练"))
+        seen.append(item["key"])
+    training_indices = {
+        item["index"] for item in described
+        if item.get("status") == "ok" and item.get("index") is not None
+    }
+    overlap = training_indices & set(inference_indices)
+    if overlap and len(training_indices) > 1:
+        names = ", ".join(f"cuda:{index}" for index in sorted(overlap))
+        results.append(CheckResult(
+            "配置", "训练设备", FAIL,
+            f"推理服务正在使用 {names}，这张卡也在训练列表里",
+            "用 CUDA_VISIBLE_DEVICES 把推理服务放到训练列表以外的卡上"))
+    elif not inference_known and len(training_indices) > 1:
+        results.append(CheckResult(
+            "配置", "训练设备", WARNING,
+            "没有看到正在运行的 vLLM 进程，无法确认它是否占用了训练卡",
+            "多卡训练时把推理服务放到训练列表以外的卡上"))
+    if not any(result.status == FAIL for result in results):
+        shown = ", ".join(item["name"] for item in described if item.get("status") == "ok")
+        if shown and not any(result.status == PASS and result.name == "训练设备" for result in results):
+            detail = shown if inference_known or len(training_indices) <= 1 else shown
+            if not any(result.name == "训练设备" and result.status == WARNING for result in results):
+                results.append(CheckResult("配置", "训练设备", PASS, detail or "未配置"))
+    return results
+
+
 def shared_gpu_memory_hint(memory_fraction, threshold=None):
     """memory_fraction 低于阈值时提示与推理同卡要留余量；不加独立配置项。"""
     from grpx.loop import SHARED_GPU_MEMORY_FRACTION_HINT
@@ -1209,6 +1322,21 @@ def run_doctor(configuration, output=print):
 
     backend_section = configuration.get("backend", {})
     backend_type = backend_section.get("type", "huggingface")
+    described = describe_training_devices(config.devices, torch)
+    inference_indices = ()
+    inference_known = True
+    if backend_type == "vllm":
+        found = query_vllm_cuda_indices()
+        if found is None:
+            inference_known = False
+        else:
+            inference_indices = found
+    report.add(*judge_training_devices(
+        described, inference_indices=inference_indices, inference_known=inference_known))
+    if report.failed:
+        output(report.summary())
+        return 1
+
     adapter_directory = None
     if backend_type == "vllm":
         # 每次预检用唯一运行目录名编进适配器前缀，避免连跑 doctor 撞名
@@ -1283,7 +1411,7 @@ def run_doctor(configuration, output=print):
             backend.synchronize_policy(model)
 
         _check_with_model(report, model, tokenizer, backend, train_dataset, evaluation_dataset,
-                          environment_factory, config, torch)
+                          environment_factory, config, torch, configuration=configuration)
         output(report.summary())
         return 1 if report.failed else 0
     finally:
@@ -1332,8 +1460,61 @@ def _attach_backend(model, tokenizer, configuration, adapter_directory=None):
     return model, tokenizer, backend
 
 
+def _probe_other_devices(report, configuration, config, prompt_token_ids, backend, padding_token_id,
+                        tokens_per_step, torch):
+    """主副本以外的每张卡再摸一次最坏小批。模型从磁盘另加载，摸完就丢掉。"""
+    from grpx.command_line import apply_lora, load_base_model_and_tokenizer
+    from grpx.device import indexed_cuda_device
+
+    for device_name in list(config.devices)[1:]:
+        report.output(f"最坏小批显存摸底（{device_name}）……")
+        extra = None
+        try:
+            extra, _tokenizer, dtype_name = load_base_model_and_tokenizer(
+                configuration["model"], device=device_name)
+            extra = apply_lora(extra, configuration["model"], config.seed, dtype_name=dtype_name)
+            extra.grpx_output_logit_chunk_size = config.output_logit_chunk_size
+            limited = indexed_cuda_device(device_name)
+            if limited is not None and torch.cuda.is_available():
+                torch.cuda.set_per_process_memory_fraction(config.memory_fraction, device=limited)
+            if config.gradient_checkpointing:
+                from grpx.gradient_checkpointing import gradient_checkpointing
+                gradient_checkpointing(extra, True)
+            trainable = {
+                name: parameter.detach().clone()
+                for name, parameter in extra.named_parameters() if parameter.requires_grad
+            }
+
+            def restore(snapshot=trainable, current=extra):
+                with torch.no_grad():
+                    for name, parameter in current.named_parameters():
+                        if name in snapshot:
+                            parameter.copy_(snapshot[name])
+
+            best, _details = probe_worst_case_shapes(
+                extra, prompt_token_ids, backend.max_new_tokens, config, padding_token_id,
+                device_name, backend.temperature, restore, tokens_per_step=tokens_per_step)
+            report.add(CheckResult(
+                "试更新", f"最坏小批 {device_name}", PASS,
+                f"峰值 {best['peak_bytes'] / 2 ** 30:.1f} GB"))
+        except Exception as error:    # noqa: BLE001
+            if is_out_of_memory(error):
+                report.add(CheckResult(
+                    "试更新", f"最坏小批 {device_name}", FAIL,
+                    f"显存不足（{_one_line(error)}）",
+                    "减小 training.max_tokens_per_minibatch，或让这一张卡不要和别的进程挤在一起"))
+            else:
+                report.add(CheckResult(
+                    "试更新", f"最坏小批 {device_name}", FAIL, _one_line(error),
+                    "确认这张卡能单独加载基座"))
+        finally:
+            del extra
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
 def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluation_dataset,
-                      environment_factory, config, torch):
+                      environment_factory, config, torch, configuration=None):
     from grpx.advantage import compute_advantages
     from grpx.device import indexed_cuda_device
     from grpx.loop import collect_trajectories, measure_policy_shift, split_into_row_chunks, update_policy
@@ -1342,10 +1523,11 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
     device = config.device
     cuda_device = indexed_cuda_device(device)
     use_cuda = cuda_device is not None and torch.cuda.is_available()
-    # 与训练同款显存上限：超额时先清缓存再明确报错，预检据此把撞上限转成失败项
-    if use_cuda:
-        torch.cuda.set_per_process_memory_fraction(
-            config.memory_fraction, device=cuda_device)
+    # 与训练同款显存上限：列表里的每张卡分别设。超额时先清缓存再明确报错
+    for device_name in config.devices:
+        limited = indexed_cuda_device(device_name)
+        if limited is not None and torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(config.memory_fraction, device=limited)
     # 与训练第 0 轮相同的种子和题目，看到的就是训练开头会遇到的情况
     torch.manual_seed(config.seed)
     samples = random.Random(config.seed).sample(train_dataset, config.groups_per_iteration)
@@ -1473,6 +1655,10 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
             f"（首提示 {len(prompt_token_ids)} + 步增 {tokens_per_step}，回答上限 "
             f"{backend.max_new_tokens}），峰值 "
             f"{best['peak_bytes'] / 2 ** 30:.1f} GB｜{shape_summary}"))
+        if configuration is not None and len(config.devices) > 1:
+            _probe_other_devices(
+                report, configuration, config, prompt_token_ids, backend, padding_token_id,
+                tokens_per_step, torch)
     except Exception as error:    # noqa: BLE001
         if is_out_of_memory(error):
             report.add(CheckResult(

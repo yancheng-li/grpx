@@ -22,7 +22,15 @@ from grpx.checkpoint import (
     find_latest_checkpoint, load_checkpoint, prune_rolling_checkpoints, save_checkpoint,
     truncate_metrics,
 )
-from grpx.gradient_checkpointing import gradient_bearing_forward, gradient_checkpointing
+from grpx.gradient_checkpointing import (
+    gradient_bearing_forward,
+    gradient_checkpointing,
+    suspend_kv_cache,
+)
+from grpx.multi_device_update import (
+    ReplicaGroup,
+    assign_minibatches,
+)
 from grpx.iteration_state import (
     accumulation_checkpoint_path,
     capture_gradients,
@@ -42,7 +50,7 @@ from grpx.trajectory_logging import (
     truncate_trajectory_samples,
 )
 from grpx.config import ALGORITHM_PRESETS, TrainingConfig    # noqa: F401  兼容旧的导入路径
-from grpx.device import indexed_cuda_device, is_cuda_device
+from grpx.device import duplicate_physical_devices, indexed_cuda_device, is_cuda_device
 from grpx.learning_rate import make_learning_rate_lambda
 
 TRAJECTORY_SAMPLES_PER_CLASS = 2
@@ -401,9 +409,290 @@ class _PeakBatchTracker:
             self.best = {**_batch_shape(batch), "phase": phase,
                          "peak_gigabytes": peak_bytes / 2 ** 30}
 
+def _batch_on_device(batch, device):
+    moved = {
+        name: value.to(device) if torch.is_tensor(value) else value
+        for name, value in batch.items()
+    }
+    return moved
+
+
+def _minibatch_token_counts(batches):
+    return [int(batch["attention_mask"].sum().item()) for batch in batches]
+
+
+def _add_captured_gradients(model, captured):
+    parameters = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+    for name, value in captured.items():
+        if value is None:
+            continue
+        parameter = parameters[name]
+        contribution = value.detach().to(device=parameter.device, dtype=parameter.dtype)
+        if parameter.grad is None:
+            parameter.grad = contribution.clone()
+        else:
+            parameter.grad.add_(contribution)
+
+
+def _accumulation_waves(batch_count, start_index, interval):
+    """按全局小批序号切段。interval 为 0 时整段一次做完。保存点落在 completed % interval == 0。"""
+    pending = list(range(start_index, batch_count))
+    if not pending:
+        return []
+    if not interval:
+        return [pending]
+    waves = []
+    current = []
+    for index in pending:
+        current.append(index)
+        completed = index + 1
+        if completed % interval == 0 and completed < batch_count:
+            waves.append(current)
+            current = []
+    if current:
+        waves.append(current)
+    return waves
+
+
+def _routing_recorders(models, record_routing):
+    if not record_routing:
+        return {}
+    from grpx.routing_diagnostics import RoutingRecorder
+
+    recorders = {}
+    for model in models:
+        recorder = RoutingRecorder(model)
+        if not recorder.is_available:
+            return {}
+        recorders[id(model)] = recorder
+    return recorders
+
+
+def _merge_routing_snapshots(snapshots_by_index):
+    from grpx.routing_diagnostics import RoutingSnapshot
+
+    merged = RoutingSnapshot()
+    for index in sorted(snapshots_by_index):
+        snapshot = snapshots_by_index[index]
+        if snapshot is None:
+            continue
+        for layer_name, tensors in snapshot.selected_by_layer.items():
+            merged.selected_by_layer.setdefault(layer_name, []).extend(tensors)
+    if not merged.layer_names():
+        return None
+    return merged
+
+
+def _accumulate_on_replicas(group, models, batches, old_log_probabilities, assignment, config,
+                            accumulation=None):
+    """各副本按事先分好的小批累积。损失除以全局分母。梯度加总后留在主副本上。"""
+    total_weight = sum(batch_segment_weight(batch) for batch in batches)
+    start_index = 0
+    weighted_metrics = []
+    held_gradients = None
+    primary = models[0]
+    if accumulation is not None:
+        trainable_names = [name for name, parameter in primary.named_parameters() if parameter.requires_grad]
+        restored = load_accumulation_checkpoint(
+            accumulation["path"], accumulation["fingerprint"], total_weight, len(batches),
+            trainable_names)
+        if restored is not None:
+            start_index = restored["next_index"]
+            weighted_metrics = [(item[0], item[1]) for item in restored["weighted_metrics"]]
+            restore_gradients(primary, restored["gradients"])
+            held_gradients = capture_gradients(primary)
+            print(f"累积梯度从第 {start_index} 个小批继续（本轮共 {len(batches)} 个小批）")
+
+    def compute_minibatch_loss(model, index, device):
+        batch = _batch_on_device(batches[index], device)
+        old_log_probability = old_log_probabilities[index].to(device)
+        new_log_probability, mask = action_log_probabilities(model, batch)
+        loss, metrics = grpo_loss(
+            new_log_probability, old_log_probability, mask, batch["advantages"],
+            row_weights=batch["row_weights"],
+            segment_ids=batch.get("segment_ids"),
+            segment_advantages=batch.get("segment_advantages"),
+            segment_weights=batch.get("segment_weights"),
+            **loss_options(config),
+        )
+        weight = batch_segment_weight(batch) / total_weight
+        return loss * weight, (weight, metrics)
+
+    interval = accumulation["interval"] if accumulation is not None else 0
+    waves = _accumulation_waves(len(batches), start_index, interval)
+    for wave_number, wave in enumerate(waves):
+        wave_set = set(wave)
+        wave_assignment = [[index for index in share if index in wave_set] for share in assignment]
+        collected = group.accumulate_gradients(wave_assignment, compute_minibatch_loss)
+        group.reduce_gradients()
+        if held_gradients is not None:
+            _add_captured_gradients(primary, held_gradients)
+        for index in wave:
+            weighted_metrics.append(collected[index])
+        completed = wave[-1] + 1
+        if (accumulation is not None and completed % interval == 0 and completed < len(batches)):
+            save_accumulation_checkpoint(
+                accumulation["path"], accumulation["fingerprint"], completed, total_weight,
+                len(batches), weighted_metrics, capture_gradients(primary))
+        if wave_number + 1 < len(waves):
+            held_gradients = capture_gradients(primary)
+    if accumulation is not None:
+        remove_accumulation_checkpoint(accumulation["path"])
+    return _average_weighted_metrics(weighted_metrics)
+
+
+def _update_on_replicas(model, replicas, optimizer, batches, config, record_routing,
+                        run_directory, iteration, trajectory_hash_value):
+    """replicas[0] 是主副本，优化器只挂在它上面。一张卡时不要走这里。"""
+    if replicas[0] is not model:
+        raise ValueError("replicas 的第一项必须是主副本")
+    devices = [replica.device for replica in replicas]
+    group = ReplicaGroup(replicas, devices)
+    try:
+        group.assert_synchronized()
+        token_counts = _minibatch_token_counts(batches)
+        assignment = assign_minibatches(token_counts, len(replicas))
+        recorders = _routing_recorders(replicas, record_routing)
+
+        def compute_old_log_probability(replica, index, device):
+            from grpx.routing_diagnostics import RoutingSnapshot
+
+            batch = _batch_on_device(batches[index], device)
+            recorder = recorders.get(id(replica))
+            if recorder is None:
+                return action_log_probabilities(replica, batch)[0], None
+            snapshot = RoutingSnapshot()
+            with recorder.record(batch["attention_mask"], snapshot=snapshot):
+                log_probability = action_log_probabilities(replica, batch)[0]
+            return log_probability, snapshot
+
+        for replica in replicas:
+            replica.eval()
+        old_parts = group.map_without_gradient(assignment, compute_old_log_probability)
+        primary_device = batches[0]["input_token_ids"].device
+        old_log_probabilities = [
+            old_parts[index][0].to(primary_device) for index in range(len(batches))]
+        routing_before = _merge_routing_snapshots(
+            {index: old_parts[index][1] for index in range(len(batches))})
+        gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
+
+        restore_caches = [suspend_kv_cache(replica) for replica in replicas]
+        history = []
+        try:
+            for _ in range(config.updates_per_iteration):
+                group.assert_synchronized()
+                optimizer.zero_grad()
+                accumulation = None
+                if config.accumulation_checkpoint_interval and run_directory is not None:
+                    if iteration is None or trajectory_hash_value is None:
+                        raise ValueError("保存累积梯度需要本轮轮次和轨迹哈希")
+                    accumulation = {
+                        "path": accumulation_checkpoint_path(run_directory),
+                        "interval": config.accumulation_checkpoint_interval,
+                        "fingerprint": make_fingerprint(
+                            config, iteration, trajectory_hash_value, model),
+                    }
+                averaged = _accumulate_on_replicas(
+                    group, replicas, batches, old_log_probabilities, assignment, config,
+                    accumulation=accumulation)
+                history.append(averaged)
+                if (config.max_approximate_kl is not None
+                        and averaged["approximate_kl"] > config.max_approximate_kl):
+                    break
+                trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.max_gradient_norm)
+                optimizer.step()
+                group.broadcast_parameters()
+        finally:
+            for restore in restore_caches:
+                restore()
+        return history, old_log_probabilities, gap_metrics, routing_before
+    finally:
+        group.close()
+
+
+def _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing_before):
+    devices = [replica.device for replica in replicas]
+    group = ReplicaGroup(replicas, devices)
+    try:
+        group.assert_synchronized()
+        assignment = assign_minibatches(_minibatch_token_counts(batches), len(replicas))
+        recorders = _routing_recorders(replicas, routing_before is not None)
+
+        def compute_shift(replica, index, device):
+            from grpx.routing_diagnostics import RoutingSnapshot
+
+            batch = _batch_on_device(batches[index], device)
+            old_log_probability = old_log_probabilities[index].to(device)
+            recorder = recorders.get(id(replica))
+            if recorder is None:
+                new_log_probability, mask = action_log_probabilities(replica, batch)
+                return (new_log_probability - old_log_probability)[mask], None
+            snapshot = RoutingSnapshot()
+            with recorder.record(batch["attention_mask"], snapshot=snapshot):
+                new_log_probability, mask = action_log_probabilities(replica, batch)
+            return (new_log_probability - old_log_probability)[mask], snapshot
+
+        for replica in replicas:
+            replica.eval()
+        parts = group.map_without_gradient(assignment, compute_shift)
+    finally:
+        group.close()
+    log_ratio = torch.cat([parts[index][0].float().cpu() for index in range(len(batches))])
+    absolute_log_ratio = log_ratio.abs()
+    metrics = {
+        "shift_clip_fraction": ((log_ratio.exp() - 1).abs() > config.clip_range).float().mean().item(),
+        "shift_median_absolute_log_ratio": absolute_log_ratio.median().item(),
+        "shift_percentile_95_absolute_log_ratio": torch.quantile(absolute_log_ratio, 0.95).item(),
+    }
+    routing_after = _merge_routing_snapshots({index: parts[index][1] for index in range(len(batches))})
+    if routing_after is not None and routing_before is not None:
+        from grpx.routing_diagnostics import summarize_routing
+        metrics.update(summarize_routing(routing_before, routing_after))
+    return metrics
+
+
+def _cuda_devices(devices):
+    seen = []
+    for name in devices:
+        cuda_device = indexed_cuda_device(name)
+        if cuda_device is None or cuda_device in seen:
+            continue
+        seen.append(cuda_device)
+    return seen
+
+
+def _apply_memory_fraction(devices, fraction):
+    for cuda_device in _cuda_devices(devices):
+        torch.cuda.set_per_process_memory_fraction(fraction, device=cuda_device)
+
+
+def _reset_peak_memory(devices):
+    for cuda_device in _cuda_devices(devices):
+        torch.cuda.reset_peak_memory_stats(cuda_device)
+
+
+def _record_peak_memory(record, devices):
+    allocated = {}
+    reserved = {}
+    for cuda_device in _cuda_devices(devices):
+        key = str(cuda_device)
+        allocated[key] = torch.cuda.max_memory_allocated(cuda_device) / 2 ** 30
+        reserved[key] = torch.cuda.max_memory_reserved(cuda_device) / 2 ** 30
+    if not allocated:
+        return
+    primary = _cuda_devices(devices[:1])
+    primary_key = str(primary[0]) if primary else next(iter(allocated))
+    record["peak_memory_gigabytes"] = allocated[primary_key]
+    record["peak_reserved_memory_gigabytes"] = reserved[primary_key]
+    if len(allocated) > 1:
+        record["peak_memory_gigabytes_by_device"] = allocated
+        record["peak_reserved_memory_gigabytes_by_device"] = reserved
+
+
 def update_policy(model, optimizer, kept, padding_token_id, config, record_routing=False,
                   minibatch_plan=None, run_directory=None, iteration=None,
-                  trajectory_hash_value=None):
+                  trajectory_hash_value=None, replicas=None):
     units = prepare_update_units(kept, merge_append_only=config.merge_append_only_turns)
     merge_fraction = merged_trajectory_fraction(kept, units)
     oversized_lengths = [
@@ -429,6 +718,12 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
         build_batch(chunk, padding_token_id, model.device, config.row_weighting)
         for chunk in chunks
     ]
+    if replicas is not None and len(replicas) > 1:
+        history, old_log_probabilities, gap_metrics, routing_before = _update_on_replicas(
+            model, replicas, optimizer, batches, config, record_routing,
+            run_directory, iteration, trajectory_hash_value)
+        return (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
+                None, oversized_stats, routing_before)
 
     peak_tracker = _PeakBatchTracker(device=getattr(config, "device", None) or model.device)
     routing_before = None
@@ -481,12 +776,15 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
     return (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
             peak_tracker.best, oversized_stats, routing_before)
 
-def measure_policy_shift(model, batches, old_log_probabilities, config, routing_before=None):
+def measure_policy_shift(model, batches, old_log_probabilities, config, routing_before=None,
+                         replicas=None):
     """更新之后对所有小批再做一遍无梯度前向，把回答位置的对数比值收集到一起，统一算分位数。
 
     必须复用 update_policy 里算旧对数概率时的同一批 tensors（切分、顺序、补齐都相同）。
     另建小批会在 bf16 下引入与学习率无关的路径差，把位移指标打成底噪。
     若传入 routing_before（来自同一次 update_policy 的旧概率前向），顺带汇总路由变化。"""
+    if replicas is not None and len(replicas) > 1:
+        return _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing_before)
     model.eval()
     log_ratios = []
     routing_after = None
@@ -525,14 +823,27 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
     run_directory：调用方已创建好的运行目录（例如 vLLM 需要先建目录再写适配器）。"""
     if config.length_normalization == "constant" and config.constant_length is None:
         config = dataclasses.replace(config, constant_length=backend.max_new_tokens)
-    if config.gradient_checkpointing:
-        gradient_checkpointing(model, True)
-    # 输出层分块：挂到模型上，action_log_probabilities 读取
-    model.grpx_output_logit_chunk_size = config.output_logit_chunk_size
-    cuda_device = indexed_cuda_device(config.device)
-    if cuda_device is not None and torch.cuda.is_available():
-        torch.cuda.set_per_process_memory_fraction(
-            config.memory_fraction, device=cuda_device)
+    replicas = list(getattr(model, "grpx_replicas", None) or [model])
+    if replicas[0] is not model:
+        raise ValueError("主副本必须是训练入口拿到的那个模型")
+    if len(replicas) == 1:
+        replicas_for_update = None
+    else:
+        replicas_for_update = replicas
+        duplicates = duplicate_physical_devices(config.devices)
+        if duplicates:
+            warnings.warn(
+                f"training.devices 里有重复的设备 {duplicates}，多份副本会挤在同一张卡上。"
+                "正式训练请让每张卡只出现一次",
+                UserWarning,
+            )
+    for replica in replicas:
+        if config.gradient_checkpointing:
+            gradient_checkpointing(replica, True)
+        replica.grpx_output_logit_chunk_size = config.output_logit_chunk_size
+    cuda_devices = _cuda_devices(config.devices)
+    if cuda_devices:
+        _apply_memory_fraction(config.devices, config.memory_fraction)
 
     if resume_from is not None:
         run_directory = pathlib.Path(resume_from)
@@ -574,7 +885,13 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
     if checkpoint_directory is not None:
         start_iteration, saved_horizon = load_checkpoint(
             checkpoint_directory, model, optimizer, scheduler, random_generator,
-            device=config.device)
+            device=config.device, devices=config.devices)
+        if replicas_for_update is not None:
+            sync_group = ReplicaGroup(replicas, [replica.device for replica in replicas])
+            try:
+                sync_group.broadcast_parameters()
+            finally:
+                sync_group.close()
         if saved_horizon is not None:
             schedule_horizon = saved_horizon
             # 用钉死的 horizon 重建 lambda；last_epoch / _last_lr 已由 load_state_dict 恢复
@@ -599,8 +916,8 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
     with open(run_directory / "metrics.jsonl", "a", encoding="utf-8", buffering=1) as log_file:
         for iteration in range(start_iteration, config.iterations):
             iteration_start_time = time.perf_counter()
-            if cuda_device is not None and torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats(cuda_device)
+            if cuda_devices:
+                _reset_peak_memory(config.devices)
             record = {"iteration": iteration, "learning_rate": scheduler.get_last_lr()[0]}
             # 评测放在本轮更新之前：第 0 轮得到的就是未训练的基线
             evaluation_seconds = 0.0
@@ -663,6 +980,7 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                     run_directory=run_directory,
                     iteration=iteration,
                     trajectory_hash_value=trajectory_hash_value,
+                    replicas=replicas_for_update,
                 )
                 record.update(oversized_stats)
                 record["merged_trajectory_fraction"] = merge_fraction
@@ -676,7 +994,8 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                         shift_start = time.perf_counter()
                         record.update(measure_policy_shift(
                             model, batches, old_log_probabilities, config,
-                            routing_before=routing_before))
+                            routing_before=routing_before,
+                            replicas=replicas_for_update))
                         shift_seconds = time.perf_counter() - shift_start
                     scheduler.step()
                     # 位移前向从 update_seconds 拆出，便于不同间隔之间比较更新耗时
@@ -692,11 +1011,8 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
             record["update_seconds"] = update_seconds
             record["shift_seconds"] = shift_seconds
             record["synchronize_seconds"] = synchronize_seconds
-            if cuda_device is not None and torch.cuda.is_available():
-                record["peak_memory_gigabytes"] = (
-                    torch.cuda.max_memory_allocated(cuda_device) / 2 ** 30)
-                record["peak_reserved_memory_gigabytes"] = (
-                    torch.cuda.max_memory_reserved(cuda_device) / 2 ** 30)
+            if cuda_devices:
+                _record_peak_memory(record, config.devices)
             record["iteration_seconds"] = time.perf_counter() - iteration_start_time
             print(format_record(record))
             # 先写日志再保存：若在两者之间被杀，恢复时截断会丢掉这轮日志并重跑，不会永久缺一轮
@@ -708,6 +1024,7 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                     or completed == config.iterations):
                 save_checkpoint(run_directory, completed, model, optimizer, scheduler,
                                 random_generator, device=config.device,
+                                devices=config.devices,
                                 schedule_horizon=schedule_horizon)
             if config.save_iteration_trajectories:
                 prune_rolling_checkpoints(

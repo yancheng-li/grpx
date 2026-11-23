@@ -261,12 +261,23 @@ def build_task(task):
     return train_dataset, evaluation_dataset, build_environment_factory(task)
 
 
-def build_model_and_backend(configuration, seed, adapter_directory=None):
+def build_model_and_backend(configuration, seed, adapter_directory=None, devices=None):
     from grpx.backends.common import resolve_end_token_ids
     from grpx.backends.huggingface import HuggingFaceBackend
+    from grpx.config import resolve_training_devices
 
-    training_device = configuration.get("training", {}).get("device", "cuda")
-    model, tokenizer = load_model(configuration["model"], seed, device=training_device)
+    if devices is None:
+        training = configuration.get("training", {})
+        _, devices = resolve_training_devices(
+            training.get("device", "cuda"), training.get("devices"))
+    models = []
+    tokenizer = None
+    for device_name in devices:
+        # 每张卡各自从磁盘加载，不要在一张卡上深拷贝再搬过去
+        model, tokenizer = load_model(configuration["model"], seed, device=device_name)
+        models.append(model)
+    model = models[0]
+    model.grpx_replicas = models
     backend_section = dict(configuration.get("backend", {}))
     validate_backend_section(backend_section)
     backend_type = backend_section.pop("type", "huggingface")
@@ -322,7 +333,8 @@ def build_components(configuration, resume_from=None):
         run_directory, adapter_directory = prepare_vllm_run_directory(
             configuration, training_config, resume_from=resume_from)
     model, tokenizer, backend = build_model_and_backend(
-        configuration, training_config.seed, adapter_directory=adapter_directory)
+        configuration, training_config.seed, adapter_directory=adapter_directory,
+        devices=training_config.devices)
     return (model, tokenizer, backend, train_dataset, environment_factory,
             training_config, evaluation_dataset, run_directory)
 

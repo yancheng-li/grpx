@@ -52,6 +52,29 @@ def _configs(model):
     return found
 
 
+def suspend_kv_cache(model):
+    """进入训练模式并关掉 use_cache，直到调用返回的恢复函数。
+
+    多卡的反向发生在另一层调用栈里，包不住同一次 with。恢复时只把 use_cache 改回去，
+    模型留在训练模式，和单卡更新结束时的状态一致。
+    """
+    previous_use_cache = []
+    for config in _configs(model):
+        use_cache = getattr(config, "use_cache", None)
+        previous_use_cache.append((config, use_cache))
+        if use_cache:
+            config.use_cache = False
+    model.train()
+
+    def restore():
+        for config, use_cache in previous_use_cache:
+            if use_cache:
+                config.use_cache = use_cache
+        model.train()
+
+    return restore
+
+
 @contextmanager
 def gradient_bearing_forward(model):
     """包住带梯度的前向和紧接着的反向。

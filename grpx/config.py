@@ -1,6 +1,11 @@
+import os
 from dataclasses import dataclass
 
 # 不导入 torch：命令行检查配置时要能立刻报错，不必等重的依赖加载
+
+# 仅供测试。正式配置和预检都不读它。设为 1 时才允许 devices 里把同一张卡写两次，
+# 用来在一张卡上把多副本路径跑通。预检仍然会拒绝。
+SAME_DEVICE_REPLICAS_ENV = "GRPX_ALLOW_SAME_DEVICE_REPLICAS"
 
 ALGORITHM_PRESETS = {
     "grpo":    {"normalize_std": True,  "length_normalization": "per_sequence",
@@ -51,8 +56,9 @@ class TrainingConfig:
     max_steps: int = 6
     # 生成被长度截断时覆盖该步回报（非整局），并一律标为不成功；None 表示不覆盖（旧行为）
     truncated_reward: float | None = 0.0
-    device: str = "cuda"                         # 训练设备，如 "cuda"、"cuda:1"、"cpu"
-    memory_fraction: float = 0.6                 # 训练进程显存上限；独占一张卡时可调到 0.95
+    device: str = "cuda"                         # 训练设备，如 "cuda"、"cuda:1"、"cpu"；多卡时是 devices[0] 的简写
+    devices: tuple[str, ...] | None = None       # 训练用的显卡。不写时等于 (device,)，一张卡走原来的单卡路径
+    memory_fraction: float = 0.6                 # 训练进程显存上限，对 devices 里的每张卡分别生效
     # 输出层按回答 token 分块做线性+CE，降低 (N, vocab) 峰值；None/0 表示不分块
     output_logit_chunk_size: int | None = 512
 
@@ -117,6 +123,7 @@ class TrainingConfig:
             raise ValueError(f"truncated_reward 应是数字或 null，收到 {self.truncated_reward!r}")
         if not isinstance(self.device, str) or not self.device.strip():
             raise ValueError(f"device 必须是非空字符串，收到 {self.device!r}")
+        self.device, self.devices = resolve_training_devices(self.device, self.devices)
         if (isinstance(self.memory_fraction, bool)
                 or not isinstance(self.memory_fraction, (int, float))
                 or not 0 < float(self.memory_fraction) <= 1):
@@ -127,3 +134,35 @@ class TrainingConfig:
     @classmethod
     def from_algorithm(cls, algorithm, **overrides):
         return cls(**{**ALGORITHM_PRESETS[algorithm], **overrides})
+
+
+def same_device_replicas_allowed():
+    """测试开关。预检不调用它，所以打开开关也不会让预检放过同一张卡。"""
+    return os.environ.get(SAME_DEVICE_REPLICAS_ENV) == "1"
+
+
+def resolve_training_devices(device, devices):
+    """device 是只写一张卡时的简写。返回 (主设备, 设备元组)。
+
+    字符串重复时默认拒绝。测试要在一张卡上放两份副本时，设置
+    GRPX_ALLOW_SAME_DEVICE_REPLICAS=1。cuda 和 cuda:0 是不是同一张卡仍交给预检，
+    预检不看这个开关。
+    """
+    if not isinstance(device, str) or not device.strip():
+        raise ValueError(f"device 必须是非空字符串，收到 {device!r}")
+    device = device.strip()
+    if devices is None:
+        return device, (device,)
+    if isinstance(devices, str) or not isinstance(devices, (list, tuple)) or len(devices) == 0:
+        raise ValueError(f"devices 必须是非空的设备列表，收到 {devices!r}")
+    normalized = []
+    for item in devices:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"devices 里的每一项都必须是非空字符串，收到 {item!r}")
+        normalized.append(item.strip())
+    if len(set(normalized)) != len(normalized) and not same_device_replicas_allowed():
+        raise ValueError(f"devices 里有重复的设备：{normalized}")
+    if device != "cuda" and device != normalized[0]:
+        raise ValueError(
+            f"device 是 devices 的简写，必须等于列表的第一项 {normalized[0]!r}，收到 {device!r}")
+    return normalized[0], tuple(normalized)

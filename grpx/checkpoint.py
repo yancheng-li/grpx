@@ -32,8 +32,35 @@ def _restore_cuda_rng_state(states, device):
     torch.cuda.set_rng_state(states, cuda_device)
 
 
+def _capture_cuda_rng_states(devices):
+    """一张卡时仍保存单个状态，旧检查点的读法不用改。多张卡保存 {设备名: 状态}。"""
+    states = {}
+    for device in devices:
+        cuda_device = indexed_cuda_device(device) if device is not None else None
+        if cuda_device is None or not torch.cuda.is_available():
+            continue
+        key = str(cuda_device)
+        if key not in states:
+            states[key] = torch.cuda.get_rng_state(cuda_device)
+    if not states:
+        return None
+    if len(states) == 1:
+        return next(iter(states.values()))
+    return states
+
+
+def _restore_cuda_rng_states(states, device=None, devices=None):
+    if states is None:
+        return
+    if isinstance(states, dict):
+        for key, value in states.items():
+            torch.cuda.set_rng_state(value, torch.device(key))
+        return
+    _restore_cuda_rng_state(states, device if device is not None else (devices[0] if devices else None))
+
+
 def save_checkpoint(run_directory, completed_iterations, model, optimizer, scheduler,
-                    random_generator, device=None, schedule_horizon=None):
+                    random_generator, device=None, schedule_horizon=None, devices=None):
     final_directory = run_directory / f"checkpoint-{completed_iterations:04d}"
     partial_directory = run_directory / f"checkpoint-{completed_iterations:04d}.partial"
     if partial_directory.exists():
@@ -50,7 +77,7 @@ def save_checkpoint(run_directory, completed_iterations, model, optimizer, sched
         "scheduler": scheduler.state_dict(),
         "python_random_state": random_generator.getstate(),
         "torch_random_state": torch.get_rng_state(),
-        "cuda_random_states": _capture_cuda_rng_state(device),
+        "cuda_random_states": _capture_cuda_rng_states(devices if devices is not None else [device]),
     }
     # 学习率衰减的总长度按开跑时的 iterations 固定；延长训练时超出部分停在终点学习率
     if schedule_horizon is not None:
@@ -94,7 +121,7 @@ def find_latest_checkpoint(run_directory):
 
 
 def load_checkpoint(checkpoint_directory, model, optimizer, scheduler, random_generator,
-                    device=None):
+                    device=None, devices=None):
     state = torch.load(checkpoint_directory / "training_state.pt",
                        map_location="cpu", weights_only=True)
     parameters = dict(model.named_parameters())
@@ -111,7 +138,7 @@ def load_checkpoint(checkpoint_directory, model, optimizer, scheduler, random_ge
     scheduler.load_state_dict(state["scheduler"])
     random_generator.setstate(state["python_random_state"])
     torch.set_rng_state(state["torch_random_state"])
-    _restore_cuda_rng_state(state["cuda_random_states"], device)
+    _restore_cuda_rng_states(state["cuda_random_states"], device=device, devices=devices)
     return state["completed_iterations"], state.get("schedule_horizon")
 
 

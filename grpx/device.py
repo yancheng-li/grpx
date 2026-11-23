@@ -33,6 +33,32 @@ def cuda_device_ordinal(device):
     return torch.cuda.current_device()
 
 
+def physical_device_key(device):
+    """用来判断两份配置是不是同一张卡。没有 CUDA 时，cuda 设备退回字符串本身。"""
+    import torch
+
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        return str(resolved)
+    if not torch.cuda.is_available():
+        return str(resolved)
+    index = resolved.index if resolved.index is not None else torch.cuda.current_device()
+    return f"cuda:{index}"
+
+
+def duplicate_physical_devices(devices):
+    """返回物理上重复的设备名。cuda 和 cuda:0 在当前设备是 0 时算同一张卡。"""
+    seen = {}
+    duplicates = []
+    for name in devices:
+        key = physical_device_key(name)
+        if key in seen:
+            duplicates.append(name)
+        else:
+            seen[key] = name
+    return duplicates
+
+
 def indexed_cuda_device(device):
     """torch.cuda.* 部分接口不接受无 index 的 'cuda'，收成 cuda:N。没有 CUDA 时返回 None。"""
     import torch
