@@ -69,7 +69,8 @@ def main():
     end_ids = resolve_end_token_ids(probe, tokenizer)
     del probe
 
-    dataset = make_dataset(size=args.size, seed=args.seed, digits=args.digits)
+    dataset = make_dataset(
+        size=args.size, seed=args.seed, digits=args.digits, prompt_variant="english_strict")
     scratch = Path("outputs/vllm_experts_eval_scratch").resolve()
     scratch.mkdir(parents=True, exist_ok=True)
 

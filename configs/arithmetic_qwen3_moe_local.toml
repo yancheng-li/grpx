@@ -18,8 +18,8 @@ max_tokens_per_batch = 2048
 environment = "examples.arithmetic:ArithmeticEnvironment"
 dataset = "examples.arithmetic:make_dataset"
 # 扫难度时改 digits / operation；乘法 digits 是每个乘数的位数
-train_dataset_options = { size = 2000, seed = 0, digits = 4, operation = "multiplication" }
-evaluation_dataset_options = { size = 200, seed = 1, digits = 4, operation = "multiplication" }
+train_dataset_options = { size = 2000, seed = 0, digits = 4, operation = "multiplication", prompt_variant = "english_strict" }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 4, operation = "multiplication", prompt_variant = "english_strict" }
 
 [training]
 algorithm = "grpo"

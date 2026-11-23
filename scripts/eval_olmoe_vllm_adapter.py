@@ -24,7 +24,7 @@ probe = AutoModelForCausalLM.from_pretrained(BASE, torch_dtype=torch.bfloat16, d
 end_ids = resolve_end_token_ids(probe, tokenizer)
 del probe
 
-dataset = make_dataset(size=200, seed=1, digits=2)
+dataset = make_dataset(size=200, seed=1, digits=2, prompt_variant="english_strict")
 
 backend = VllmBackend(
     tokenizer, end_ids,

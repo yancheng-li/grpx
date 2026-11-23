@@ -1,7 +1,7 @@
 """注意力 / 专家对照用：固定 500 道三位数加法，贪心重评检查点。
 
 评测集约定（两组必须相同）：
-  make_dataset(size=500, digits=3, seed=1)
+  make_dataset(size=500, digits=3, seed=1, prompt_variant="english_strict")
 """
 from __future__ import annotations
 
@@ -45,7 +45,8 @@ def main():
     )
     arguments = parser.parse_args()
 
-    dataset = make_dataset(size=EVAL_SIZE, digits=EVAL_DIGITS, seed=EVAL_SEED)
+    dataset = make_dataset(
+        size=EVAL_SIZE, digits=EVAL_DIGITS, seed=EVAL_SEED, prompt_variant="english_strict")
     environment_factory = lambda: SingleTurnEnvironment(
         reward_function, success_function=is_correct)
 

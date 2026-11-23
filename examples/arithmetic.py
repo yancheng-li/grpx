@@ -4,13 +4,34 @@ import re
 from grpx.environment import SingleTurnEnvironment
 
 ALLOWED_OPERATIONS = ("addition", "multiplication")
+PROMPT_VARIANTS = ("chinese_short", "english_strict")
 
 
-def make_dataset(size, digits=4, seed=0, digit_count=None, operation="addition"):
+def render_prompt(left, operator_symbol, right, prompt_variant):
+    """chinese_short 是最初的默认句；english_strict 是 OLMoE 用的英文句，必须显式指定。"""
+    if prompt_variant == "chinese_short":
+        return f"计算 {left} {operator_symbol} {right}，只输出数字。"
+    if prompt_variant == "english_strict":
+        return (
+            f"Compute {left} {operator_symbol} {right}. "
+            "Output only the final integer answer with no equation, "
+            "explanation, or other text."
+        )
+    raise ValueError(
+        f"未知的 prompt_variant：{prompt_variant!r}，可选 {sorted(PROMPT_VARIANTS)}")
+
+
+def make_dataset(size, digits=4, seed=0, digit_count=None, operation="addition",
+                 prompt_variant="chinese_short"):
     """生成算术题。digits / digit_count 为每个操作数的位数，默认 4。
 
     operation 取 "addition" 或 "multiplication"（默认加法，与历史评测集兼容）。
+    prompt_variant 取 "chinese_short"（默认，快速开始用的中文短句）或
+    "english_strict"（OLMoE 和 Qwen3 结果用的英文句子）。
     """
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(
+            f"未知的 prompt_variant：{prompt_variant!r}，可选 {sorted(PROMPT_VARIANTS)}")
     if digit_count is not None:
         digits = digit_count
     if operation not in ALLOWED_OPERATIONS:
@@ -28,11 +49,7 @@ def make_dataset(size, digits=4, seed=0, digit_count=None, operation="addition")
         answer = left + right if operation == "addition" else left * right
         dataset.append(
             {
-                "prompt": (
-                    f"Compute {left} {operator_symbol} {right}. "
-                    "Output only the final integer answer with no equation, "
-                    "explanation, or other text."
-                ),
+                "prompt": render_prompt(left, operator_symbol, right, prompt_variant),
                 "answer": answer,
                 "digits": digits,
                 "operation": operation,
@@ -41,7 +58,8 @@ def make_dataset(size, digits=4, seed=0, digit_count=None, operation="addition")
     return dataset
 
 
-def make_mixed_digit_dataset(size, seed=0, digit_counts=(2, 3), operation="addition"):
+def make_mixed_digit_dataset(size, seed=0, digit_counts=(2, 3), operation="addition",
+                             prompt_variant="chinese_short"):
     """按位数均分的混合算术集；每条样本带 digits / operation，便于评测时分开报成功率。"""
     digit_counts = tuple(digit_counts)
     if not digit_counts:
@@ -54,7 +72,7 @@ def make_mixed_digit_dataset(size, seed=0, digit_counts=(2, 3), operation="addit
     for offset, digits in enumerate(digit_counts):
         dataset.extend(make_dataset(
             size=per_bucket, digits=digits, seed=seed + 10007 * (offset + 1),
-            operation=operation))
+            operation=operation, prompt_variant=prompt_variant))
     random.Random(seed).shuffle(dataset)
     return dataset
 

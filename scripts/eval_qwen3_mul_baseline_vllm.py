@@ -1,7 +1,7 @@
 """Qwen3-30B：训练前基线，vLLM 贪心评测固定 500 道三/四位数乘法。
 
 约定：
-  make_dataset(size=500, digits=3|4, seed=1, operation="multiplication")
+  make_dataset(size=500, digits=3|4, seed=1, operation="multiplication", prompt_variant="english_strict")
 """
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 def evaluate_digits(backend, tokenizer, digits, size, seed, max_steps=1):
     dataset = make_dataset(
-        size=size, digits=digits, seed=seed, operation="multiplication")
+        size=size, digits=digits, seed=seed, operation="multiplication",
+        prompt_variant="english_strict")
     metrics = evaluate(
         backend,
         tokenizer,

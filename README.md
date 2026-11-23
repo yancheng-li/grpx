@@ -884,3 +884,11 @@ pytest
 ```bash
 python scripts/compare_same_batch_shift.py --config configs/guess_number_vllm.toml
 ```
+
+改动了示例任务（提示词、答案提取、数据集）之后，跑一次快速开始的基线检查。它只做训练前的那次评测，确认结果和本文档写的一致，需要 GPU，约一分钟：
+
+```bash
+python scripts/check_arithmetic_baseline.py
+```
+
+示例任务的提示词是结果的一部分。四位数加法的默认提示词是中文的短句；MoE 模型的配置用的是另一句英文提示词，在配置里用 `prompt_variant = "english_strict"` 显式指定。只换这一句话，Qwen2.5-0.5B 训练前的评测成功率就从 0.645 变成 0.48。

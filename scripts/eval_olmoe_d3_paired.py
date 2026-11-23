@@ -44,7 +44,7 @@ def main():
     checkpoint = arguments.checkpoint.resolve()
     dataset = make_dataset(
         arguments.size, digits=arguments.digits, seed=arguments.seed,
-        operation="addition")
+        operation="addition", prompt_variant="english_strict")
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     print("loading base", flush=True)
     base = AutoModelForCausalLM.from_pretrained(

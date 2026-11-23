@@ -22,8 +22,8 @@ max_concurrent_requests = 64
 [task]
 environment = "examples.arithmetic:ArithmeticEnvironment"
 dataset = "examples.arithmetic:make_dataset"
-train_dataset_options = { size = 2000, seed = 0, digits = 3, operation = "multiplication" }
-evaluation_dataset_options = { size = 200, seed = 1, digits = 3, operation = "multiplication" }
+train_dataset_options = { size = 2000, seed = 0, digits = 3, operation = "multiplication", prompt_variant = "english_strict" }
+evaluation_dataset_options = { size = 200, seed = 1, digits = 3, operation = "multiplication", prompt_variant = "english_strict" }
 
 [training]
 algorithm = "grpo"

@@ -146,7 +146,7 @@ def main():
     backend.adapter_name = MODEL
     probe_dataset = make_dataset(
         arguments.probe_count, digits=arguments.digits[0], seed=arguments.seed,
-        operation="multiplication")
+        operation="multiplication", prompt_variant="english_strict")
     base_probe = decode_greedy_answers(
         backend, tokenizer, probe_dataset, limit=arguments.probe_count)
 
@@ -194,7 +194,7 @@ def main():
     for digits in arguments.digits:
         dataset = make_dataset(
             arguments.size, digits=digits, seed=arguments.seed,
-            operation="multiplication")
+            operation="multiplication", prompt_variant="english_strict")
         backend.adapter_name = MODEL
         before = greedy_successes(backend, tokenizer, dataset)
         backend.adapter_name = adapter_name

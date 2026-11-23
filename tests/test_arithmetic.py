@@ -68,12 +68,26 @@ def test_dataset_size_and_answers():
     assert all(sample["operation"] == "addition" for sample in dataset)
 
 
-def test_dataset_prompt_is_english_and_digit_count_alias():
-    sample = make_dataset(1, digits=2, seed=0)[0]
-    assert sample["prompt"].startswith("Compute ")
-    assert " + " in sample["prompt"]
-    assert "Output only the final integer" in sample["prompt"]
+def test_digit_count_alias():
     assert make_dataset(4, digit_count=3, seed=1) == make_dataset(4, digits=3, seed=1)
+
+
+def test_prompt_variants_lock_the_first_sample():
+    # 固定种子的第一题。两种写法的完整提示词都写死，题目数字相同。
+    chinese = make_dataset(1, digits=3, seed=1)[0]
+    english = make_dataset(1, digits=3, seed=1, prompt_variant="english_strict")[0]
+    assert chinese["prompt"] == "计算 237 + 682，只输出数字。"
+    assert english["prompt"] == (
+        "Compute 237 + 682. "
+        "Output only the final integer answer with no equation, "
+        "explanation, or other text."
+    )
+    assert chinese["answer"] == english["answer"] == 919
+
+
+def test_unknown_prompt_variant():
+    with pytest.raises(ValueError, match="prompt_variant"):
+        make_dataset(1, prompt_variant="formal")
 
 
 def test_dataset_is_reproducible():
@@ -82,17 +96,17 @@ def test_dataset_is_reproducible():
 
 
 def test_default_addition_matches_pre_operation_extension():
-    # 改动前 make_dataset(size=500, seed=1, digits=3) 的前几道题；RNG 与题面必须保持不变
+    # 操作数和答案与加入 operation 之前逐题相同；默认提示词是中文短句
     expected = [
-        ("Compute 237 + 682. ", 919),
-        ("Compute 967 + 921. ", 1888),
-        ("Compute 882 + 164. ", 1046),
-        ("Compute 361 + 220. ", 581),
-        ("Compute 607 + 879. ", 1486),
+        ("计算 237 + 682，只输出数字。", 919),
+        ("计算 967 + 921，只输出数字。", 1888),
+        ("计算 882 + 164，只输出数字。", 1046),
+        ("计算 361 + 220，只输出数字。", 581),
+        ("计算 607 + 879，只输出数字。", 1486),
     ]
     dataset = make_dataset(500, seed=1, digits=3)
-    for index, (prefix, answer) in enumerate(expected):
-        assert dataset[index]["prompt"].startswith(prefix)
+    for index, (prompt, answer) in enumerate(expected):
+        assert dataset[index]["prompt"] == prompt
         assert dataset[index]["answer"] == answer
         assert dataset[index]["digits"] == 3
         assert dataset[index]["operation"] == "addition"
@@ -116,6 +130,20 @@ def test_multiplication_dataset():
 def test_operation_must_be_known():
     with pytest.raises(ValueError, match="operation"):
         make_dataset(1, operation="mul")
+
+
+def test_moe_configs_pin_english_prompt():
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "configs"
+    paths = sorted(root.glob("arithmetic_olmoe*.toml")) + sorted(root.glob("arithmetic_qwen3*.toml"))
+    assert paths, "没有找到 MoE 算术配置"
+    for path in paths:
+        with path.open("rb") as handle:
+            task = tomllib.load(handle)["task"]
+        for key in ("train_dataset_options", "evaluation_dataset_options"):
+            assert task[key].get("prompt_variant") == "english_strict", f"{path.name} 的 {key}"
 
 
 def test_digits_can_exceed_ten():
