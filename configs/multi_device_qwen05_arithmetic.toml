@@ -1,0 +1,27 @@
+# 两张卡上的更新对比：Qwen2.5-0.5B，四位数加法，回答短。
+# 快速开始仍用 configs/arithmetic.toml（默认 float32、中文提示词）。
+# 这里固定 bfloat16，采样走本地后端。devices 由计时脚本传入，不要写进本文件。
+
+[model]
+name = "Qwen/Qwen2.5-0.5B-Instruct"
+dtype = "bfloat16"
+lora_rank = 16
+lora_alpha = 32
+
+[backend]
+max_new_tokens = 32
+temperature = 1.0
+
+[task]
+reward_function = "examples.arithmetic:reward_function"
+success_function = "examples.arithmetic:is_correct"
+dataset = "examples.arithmetic:make_dataset"
+train_dataset_options = { size = 2000, seed = 0 }
+evaluation_dataset_options = { size = 200, seed = 1 }
+
+[training]
+algorithm = "grpo"
+max_steps = 1
+iterations = 30
+groups_per_iteration = 16
+evaluation_interval = 5

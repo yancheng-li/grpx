@@ -1,0 +1,33 @@
+# 两张卡上的更新对比：Qwen2.5-1.5B，带计算器，序列按 2048 token 的小批上限切。
+# 任务设置与 configs/gsm8k_calculator_vllm.toml 相同，采样改为本地后端，
+# 这样两张卡都用来训练时不必另起推理服务。
+# devices 由计时脚本传入，不要写进本文件。
+
+[model]
+name = "Qwen/Qwen2.5-1.5B-Instruct"
+dtype = "bfloat16"
+
+[backend]
+max_new_tokens = 256
+temperature = 1.0
+
+[task]
+environment = "examples.gsm8k_calculator:CalculatorEnvironment"
+environment_options = { success_function = "examples.gsm8k:success_function", reward_function = "examples.gsm8k:reward_function", question_field = "question" }
+dataset = "examples.gsm8k:make_dataset"
+train_dataset_options = { split = "train" }
+evaluation_dataset_options = { split = "test", size = 500, seed = 0 }
+
+[training]
+algorithm = "grpo"
+iterations = 60
+groups_per_iteration = 32
+group_size = 8
+max_steps = 8
+learning_rate = 1e-5
+merge_append_only_turns = true
+max_rows_per_minibatch = 16
+max_tokens_per_minibatch = 2048
+shift_measurement_interval = 5
+evaluation_interval = 10
+checkpoint_interval = 10
