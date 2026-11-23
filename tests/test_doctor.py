@@ -236,41 +236,48 @@ def test_backend_log_probability_gap_uses_tail():
     assert judge_backend_log_probability_gap({}).status == WARNING
     assert judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-7,
-        "backend_log_probability_gap_p95": 5e-4,
-        "backend_log_probability_gap_above_half_fraction": 0.0,
-        "backend_log_probability_gap_max": 0.12,
+        "backend_log_probability_gap_p95": 0.16,
+        "backend_log_probability_gap_above_one_fraction": 0.0,
+        "backend_log_probability_gap_max": 1.64,
     }).status == PASS
-    # 高熵任务：p95 偏高但无尾部大偏差 → 只警告
+    # 差超过 1 的比例落在 0.3% 和 1% 之间 → 只警告
     warned = judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-3,
         "backend_log_probability_gap_p95": 0.05,
-        "backend_log_probability_gap_above_half_fraction": 0.0,
-        "backend_log_probability_gap_max": 0.24,
+        "backend_log_probability_gap_above_one_fraction": 0.006,
+        "backend_log_probability_gap_max": 1.64,
     })
     assert warned.status == WARNING
-    assert "高熵" in warned.suggestion
-    # 孤立大偏差：max 略高于旧阈值 1，但远低于新阈值 5，且比例正常 → 通过
+    assert "0.3%" in warned.detail or "0.003" in warned.detail
+    # 最大差 1.64、比例低于警告线 → 通过
     assert judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-7,
         "backend_log_probability_gap_p95": 1e-5,
-        "backend_log_probability_gap_above_half_fraction": 1.1e-4,
-        "backend_log_probability_gap_max": 1.03,
+        "backend_log_probability_gap_above_one_fraction": 1.1e-4,
+        "backend_log_probability_gap_max": 1.64,
     }).status == PASS
-    # 配置错位：尾部大偏差（比例超标）
+    # 配置错位：差超过 1 的比例到了百分之几
     failed = judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-7,
         "backend_log_probability_gap_p95": 0.05,
-        "backend_log_probability_gap_above_half_fraction": 0.02,
+        "backend_log_probability_gap_above_one_fraction": 0.02,
         "backend_log_probability_gap_max": 8.0,
     })
     assert failed.status == FAIL
     assert "rope_theta" in failed.suggestion
-    # 配置错位：单点 max 也到了错位量级
+    # 配置错位：最大差到了 5 以上
     assert judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-7,
         "backend_log_probability_gap_p95": 1e-4,
-        "backend_log_probability_gap_above_half_fraction": 0.0,
+        "backend_log_probability_gap_above_one_fraction": 0.0,
         "backend_log_probability_gap_max": 5.1,
+    }).status == FAIL
+    # 中位数超过 0.05，即使尾部很轻
+    assert judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 0.06,
+        "backend_log_probability_gap_p95": 0.08,
+        "backend_log_probability_gap_above_one_fraction": 0.0,
+        "backend_log_probability_gap_max": 0.2,
     }).status == FAIL
 
 def shift(median, percentile_95, clip_fraction):

@@ -171,6 +171,7 @@ def test_gap_metrics_take_max_across_urls_and_name_worst():
     assert metrics["backend_log_probability_gap_median"] == pytest.approx(2.0)
     assert metrics["backend_log_probability_gap_max"] == pytest.approx(2.0)
     assert metrics["backend_log_probability_gap_above_half_fraction"] == pytest.approx(1.0)
+    assert metrics["backend_log_probability_gap_above_one_fraction"] == pytest.approx(1.0)
     assert metrics["backend_log_probability_gap_worst_url"] == "http://b"
     assert "gap_by_url" in metrics
     with pytest.raises(RuntimeError, match="http://b"):

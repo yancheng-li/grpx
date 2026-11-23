@@ -179,11 +179,11 @@ def test_load_adapter_rejects_trained_base_mismatch_despite_server_alias(tmp_pat
 
 
 def test_enforce_gap_hard_on_first_process_check_warns_later():
-    # 硬失败看尾部大偏差，不看 p95
+    # 硬失败看差超过 1 的比例、最大差和中位数
     metrics = {
         "backend_log_probability_gap_median": 1e-7,
         "backend_log_probability_gap_p95": 0.05,
-        "backend_log_probability_gap_above_half_fraction": 0.03,
+        "backend_log_probability_gap_above_one_fraction": 0.03,
         "backend_log_probability_gap_max": 8.0,
     }
     with pytest.raises(RuntimeError, match="不是同一个模型"):
@@ -199,43 +199,43 @@ def test_enforce_gap_passes_when_small_or_missing():
     enforce_backend_log_probability_gap(
         {
             "backend_log_probability_gap_median": 0.003,
-            "backend_log_probability_gap_p95": 0.003,
-            "backend_log_probability_gap_above_half_fraction": 0.0,
-            "backend_log_probability_gap_max": 0.2,
+            "backend_log_probability_gap_p95": 0.16,
+            "backend_log_probability_gap_above_one_fraction": 0.0,
+            "backend_log_probability_gap_max": 1.64,
         },
         hard=True)
-    # 孤立 token 略超旧阈值 1，但比例正常 → 不硬中止
+    # 差超过 1 的比例 0.011%，低于 0.3% 的警告线
     enforce_backend_log_probability_gap(
         {
             "backend_log_probability_gap_median": 1e-7,
             "backend_log_probability_gap_p95": 1.1e-5,
-            "backend_log_probability_gap_above_half_fraction": 1.1e-4,
-            "backend_log_probability_gap_max": 1.03,
+            "backend_log_probability_gap_above_one_fraction": 1.1e-4,
+            "backend_log_probability_gap_max": 1.64,
         },
         hard=True)
     enforce_backend_log_probability_gap({}, hard=True)
 
 
-def test_enforce_gap_p95_warns_without_hard_fail():
-    # 高熵噪声：p95 偏高但无尾部大偏差 → 警告，不中止
-    with pytest.warns(UserWarning, match="高熵"):
+def test_enforce_gap_above_one_warns_without_hard_fail():
+    with pytest.warns(UserWarning, match="above_one_fraction"):
         enforce_backend_log_probability_gap(
             {
-                "backend_log_probability_gap_median": 0.01,
-                "backend_log_probability_gap_p95": 0.05,
-                "backend_log_probability_gap_above_half_fraction": 0.0,
-                "backend_log_probability_gap_max": 0.24,
+                "backend_log_probability_gap_median": 0.003,
+                "backend_log_probability_gap_p95": 0.16,
+                "backend_log_probability_gap_above_one_fraction": 0.006,
+                "backend_log_probability_gap_max": 1.64,
             },
             hard=True,
         )
 
 
-def test_enforce_gap_ignores_large_median_when_tail_ok():
-    enforce_backend_log_probability_gap(
-        {
-            "backend_log_probability_gap_median": 0.46,
-            "backend_log_probability_gap_p95": 0.005,
-            "backend_log_probability_gap_above_half_fraction": 0.0,
-            "backend_log_probability_gap_max": 0.5,
-        },
-        hard=True)
+def test_enforce_gap_hard_fails_on_large_median():
+    with pytest.raises(RuntimeError, match="不是同一个模型"):
+        enforce_backend_log_probability_gap(
+            {
+                "backend_log_probability_gap_median": 0.46,
+                "backend_log_probability_gap_p95": 0.5,
+                "backend_log_probability_gap_above_one_fraction": 0.0,
+                "backend_log_probability_gap_max": 0.5,
+            },
+            hard=True)

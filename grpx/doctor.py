@@ -430,14 +430,16 @@ def judge_first_step_ratio(max_ratio_deviation):
 def judge_backend_log_probability_gap(gap_metrics):
     """采样时服务端 logprob 与训练端重算之差。
 
-    硬失败看尾部大偏差（|Δ|>0.5 的比例 / 最大差）；p95 过高只警告，
-    因为高熵任务上正常也可到 0.04–0.05。
+    硬失败：差超过 1 的比例 > 1%，或最大差 > 5，或中位数 > 0.05。
+    警告：差超过 1 的比例 > 0.3%。限度按普通模型定。
     """
     from grpx.loop import (
-        BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT,
+        BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT,
+        BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN,
         BACKEND_LOGPROB_GAP_MAX_LIMIT,
-        BACKEND_LOGPROB_GAP_P95_WARN,
+        BACKEND_LOGPROB_GAP_MEDIAN_LIMIT,
         backend_log_probability_gap_is_hard_failure,
+        backend_log_probability_gap_is_warning,
     )
     if not gap_metrics:
         return CheckResult(
@@ -445,15 +447,15 @@ def judge_backend_log_probability_gap(gap_metrics):
             "本地后端或未返回 logprob 时会跳过；用 vLLM 后端时可看到这项")
     p95 = gap_metrics.get("backend_log_probability_gap_p95")
     median = gap_metrics.get("backend_log_probability_gap_median")
-    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
     gap_max = gap_metrics.get("backend_log_probability_gap_max")
-    if p95 is None and above is None and gap_max is None:
+    if p95 is None and above is None and gap_max is None and median is None:
         return CheckResult(
             "训推一致", "采样对数概率差", WARNING, "没有可比对的采样对数概率",
             "确认推理服务返回了 token logprobs")
     parts = []
     if above is not None:
-        parts.append(f"|Δ|>0.5 比例 {above:.2e}")
+        parts.append(f"|Δ|>1 比例 {above:.2e}")
     if gap_max is not None:
         parts.append(f"最大 {gap_max:.2e}")
     if p95 is not None:
@@ -464,15 +466,17 @@ def judge_backend_log_probability_gap(gap_metrics):
     if backend_log_probability_gap_is_hard_failure(gap_metrics):
         return CheckResult(
             "训推一致", "采样对数概率差", FAIL,
-            f"{detail}；尾部大偏差超过阈值"
-            f"（比例>{BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT:g} 或 最大>{BACKEND_LOGPROB_GAP_MAX_LIMIT:g}）",
+            f"{detail}；超过硬限度"
+            f"（|Δ|>1 比例>{BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT:g}"
+            f" 或 最大>{BACKEND_LOGPROB_GAP_MAX_LIMIT:g}"
+            f" 或 中位数>{BACKEND_LOGPROB_GAP_MEDIAN_LIMIT:g}）",
             "训练端和推理端不是同一份有效模型：检查基座路径、分词器、对话模板，"
             "以及合并模型 config.json 是否仍有顶层 rope_theta（transformers 5.x 可能只写在 rope_parameters 里）")
-    if p95 is not None and p95 > BACKEND_LOGPROB_GAP_P95_WARN:
+    if backend_log_probability_gap_is_warning(gap_metrics):
         return CheckResult(
             "训推一致", "采样对数概率差", WARNING,
-            f"{detail}；p95 超过 {BACKEND_LOGPROB_GAP_P95_WARN:g}",
-            "高熵任务下可能是正常噪声；若同时出现差超过 0.5 的 token，再按配置错位排查")
+            f"{detail}；|Δ|>1 比例超过 {BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN:g}",
+            "普通模型上偶发到这个范围，先不中止；比例到百分之几才按配置错位排查")
     return CheckResult("训推一致", "采样对数概率差", PASS, detail)
 
 

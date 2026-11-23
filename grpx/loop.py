@@ -85,14 +85,15 @@ def collect_trajectories(
         truncated_reward=config.truncated_reward,
     )
 
-# 第 0 轮 LoRA 增量近零，中位数应只差精度（千分之几）；超过此值视为训推不是同一模型
-# 尾部大偏差才能把「配置错位」和「高熵任务下的正常数值噪声」分开：
-# 对齐时 |Δ|>0.5 的比例≈0、最大差≲0.3；错位时比例为百分之几、最大差可达 5–11。
-BACKEND_LOGPROB_GAP_LARGE = 0.5
-BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT = 0.001   # 0.1%
+# 第 0 轮 LoRA 增量近零，中位数应只差精度（千分之几）；超过 0.05 视为训推不是同一模型。
+# 尾部用「差超过 1」的比例。普通模型上，配置正确时这个比例在 0 到约 0.6%，
+# 最大差到过 1.6；配置错位（例如 RoPE 用了默认 10000）时比例是 2%–4%，最大差 5–11。
+# 警告线 0.3%、硬失败 1%，两边各留出余量。限度按普通模型定，MoE 上还没有校准。
+BACKEND_LOGPROB_GAP_ONE = 1.0
+BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN = 0.003    # 0.3%，只提示
+BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT = 0.01    # 1%
 BACKEND_LOGPROB_GAP_MAX_LIMIT = 5.0
-# p95 只作警告：高熵任务上正常也可到 0.04–0.05
-BACKEND_LOGPROB_GAP_P95_WARN = 0.01
+BACKEND_LOGPROB_GAP_MEDIAN_LIMIT = 0.05
 
 
 def measure_backend_log_probability_gap(batches, old_log_probabilities):
@@ -123,21 +124,24 @@ def measure_backend_log_probability_gap(batches, old_log_probabilities):
     medians = {}
     percentiles = {}
     above_half = {}
+    above_one = {}
     maxima = {}
     for url, pieces in gaps_by_url.items():
         gap = torch.cat(pieces).float()
         medians[url] = gap.median().item()
         percentiles[url] = torch.quantile(gap, 0.95).item()
-        above_half[url] = (gap > BACKEND_LOGPROB_GAP_LARGE).float().mean().item()
+        above_half[url] = (gap > 0.5).float().mean().item()
+        above_one[url] = (gap > BACKEND_LOGPROB_GAP_ONE).float().mean().item()
         maxima[url] = gap.max().item()
-    # 最差地址按尾部大偏差排；没有尾部时退回 p95
+    # 最差地址按「差超过 1」的比例排；没有这种 token 时退回最大差
     worst_url = max(
         percentiles,
-        key=lambda url: (above_half[url], maxima[url], percentiles[url]))
+        key=lambda url: (above_one[url], maxima[url], percentiles[url]))
     metrics = {
         "backend_log_probability_gap_median": medians[worst_url],
         "backend_log_probability_gap_p95": percentiles[worst_url],
         "backend_log_probability_gap_above_half_fraction": max(above_half.values()),
+        "backend_log_probability_gap_above_one_fraction": max(above_one.values()),
         "backend_log_probability_gap_max": max(maxima.values()),
         "gap_by_url": percentiles,
     }
@@ -147,13 +151,13 @@ def measure_backend_log_probability_gap(batches, old_log_probabilities):
 
 
 def _gap_mismatch_message(gap_metrics):
-    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
     gap_max = gap_metrics.get("backend_log_probability_gap_max")
     p95 = gap_metrics.get("backend_log_probability_gap_p95")
     median = gap_metrics.get("backend_log_probability_gap_median")
     parts = []
     if above is not None:
-        parts.append(f"above_half_fraction={above:.2e}")
+        parts.append(f"above_one_fraction={above:.2e}")
     if gap_max is not None:
         parts.append(f"max={gap_max:.2e}")
     if p95 is not None:
@@ -179,19 +183,30 @@ def _gap_mismatch_message(gap_metrics):
 
 
 def backend_log_probability_gap_is_hard_failure(gap_metrics):
-    """尾部大偏差：|Δ|>0.5 的比例 > 0.1%，或最大差 > 1。"""
-    above = gap_metrics.get("backend_log_probability_gap_above_half_fraction")
+    """差超过 1 的比例 > 1%，或最大差 > 5，或中位数 > 0.05。"""
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
     gap_max = gap_metrics.get("backend_log_probability_gap_max")
+    median = gap_metrics.get("backend_log_probability_gap_median")
     return (
-        (above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_HALF_LIMIT)
+        (above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT)
         or (gap_max is not None and gap_max > BACKEND_LOGPROB_GAP_MAX_LIMIT)
+        or (median is not None and median > BACKEND_LOGPROB_GAP_MEDIAN_LIMIT)
     )
 
 
+def backend_log_probability_gap_is_warning(gap_metrics):
+    """差超过 1 的比例 > 0.3%。硬失败时不算警告。"""
+    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+        return False
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
+    return above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN
+
+
 def enforce_backend_log_probability_gap(gap_metrics, *, hard=False):
-    """硬失败看尾部大偏差；p95 过高只警告（高熵任务下可能是正常噪声）。
+    """硬失败看差超过 1 的比例、最大差和中位数；0.3%–1% 只警告。
 
     hard=True 用于本进程首次核对（含 --resume），与 iteration 编号无关。
+    之后的轮次即使越过硬限度也只警告，避免一次采样噪声中断已经在跑的训练。
     """
     if backend_log_probability_gap_is_hard_failure(gap_metrics):
         message = _gap_mismatch_message(gap_metrics)
@@ -199,12 +214,13 @@ def enforce_backend_log_probability_gap(gap_metrics, *, hard=False):
             raise RuntimeError(message)
         warnings.warn(message, stacklevel=2)
         return
-    p95 = gap_metrics.get("backend_log_probability_gap_p95")
-    if p95 is not None and p95 > BACKEND_LOGPROB_GAP_P95_WARN:
+    if backend_log_probability_gap_is_warning(gap_metrics):
+        above = gap_metrics["backend_log_probability_gap_above_one_fraction"]
         warnings.warn(
-            f"backend_log_probability_gap_p95={p95:.2e} 超过 {BACKEND_LOGPROB_GAP_P95_WARN:g}；"
-            "高熵任务下可能是正常噪声。"
-            "若同时出现差超过 0.5 的 token（above_half_fraction / max），才按配置错位处理。",
+            f"backend_log_probability_gap_above_one_fraction={above:.2e} "
+            f"超过 {BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN:g}；"
+            "普通模型上偶发到这个范围，先不中止。"
+            "比例到百分之几，或最大差超过 5，才按配置错位处理。",
             stacklevel=2,
         )
 
