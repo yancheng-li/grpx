@@ -70,8 +70,10 @@ def rollout_groups(backend: GenerationBackend, tokenizer, environment_factory, g
                 action_token_ids, was_truncated = output[0], output[1]
                 # 兼容旧假后端：(ids, truncated) / (ids, truncated, logprobs)
                 # 新后端：(ids, truncated, logprobs|None, finish_reason)
+                # 重放时再多一项：int8 的专家记录
                 backend_log_probabilities = None
                 finish_reason = None
+                routed_experts = output[4] if len(output) > 4 else None
                 if len(output) > 3:
                     backend_log_probabilities = output[2]
                     finish_reason = output[3]
@@ -96,7 +98,8 @@ def rollout_groups(backend: GenerationBackend, tokenizer, environment_factory, g
                          backend_log_probabilities=backend_log_probabilities,
                          backend_base_url=base_url,
                          environment_reward=environment_reward,
-                         finish_reason=finish_reason)
+                         finish_reason=finish_reason,
+                         routed_experts=routed_experts)
                 )
                 conversations[index] += (
                     [{"role": "assistant", "content": action_text}] + new_messages

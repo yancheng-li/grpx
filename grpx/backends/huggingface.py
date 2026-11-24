@@ -15,6 +15,8 @@ class HuggingFaceBackend:
         self.max_rows_per_batch, self.max_tokens_per_batch = max_rows_per_batch, max_tokens_per_batch
         self.stop_strings = normalize_stop_strings(stop_strings)
         self.end_token_ids = resolve_end_token_ids(model, tokenizer)
+        # 打开后，生成结果多带每个回答 token 的原始对数概率，以及按训练行对齐的专家记录
+        self.record_routing = False
 
     def synchronize_policy(self, model):
         return
@@ -50,6 +52,9 @@ class HuggingFaceBackend:
 
     def _run_generation_batch(self, prompts, generation_config):
         """多条提示词（长度可不同），每条生成一个样本"""
+        # 贪心评测不需要专家记录。只在采样时记，评测仍走原来的生成路径
+        if self.record_routing and generation_config.do_sample:
+            return self._run_generation_batch_with_routing(prompts, generation_config)
         row_count = len(prompts)
         max_length = max(len(prompt) for prompt in prompts)
         input_token_ids = torch.full((row_count, max_length), generation_config.pad_token_id,
@@ -103,6 +108,85 @@ class HuggingFaceBackend:
             )
             results.append((
                 action_token_ids, finish_reason == "length_limit", None, finish_reason))
+        return results
+
+    def _run_generation_batch_with_routing(self, prompts, generation_config):
+        """和上面同一套左填充采样，另外记下专家选择和温度为 1 的原始对数概率。"""
+        from grpx.routing_replay import (
+            RoutingCapture,
+            align_generated_routing,
+            assemble_captured_routing,
+        )
+
+        row_count = len(prompts)
+        max_length = max(len(prompt) for prompt in prompts)
+        input_token_ids = torch.full(
+            (row_count, max_length), generation_config.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((row_count, max_length), dtype=torch.long)
+        for row_index, prompt in enumerate(prompts):
+            start = max_length - len(prompt)
+            input_token_ids[row_index, start:] = torch.tensor(prompt)
+            attention_mask[row_index, start:] = 1
+        input_token_ids = input_token_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
+
+        was_training = self.model.training
+        self.model.eval()
+        capture = RoutingCapture(self.model)
+        generate_options = dict(
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        if self.stop_strings:
+            generate_options["stop_strings"] = list(self.stop_strings)
+            generate_options["tokenizer"] = self.tokenizer
+        try:
+            with capture.capture() as calls:
+                output = self.model.generate(input_token_ids, **generate_options)
+        finally:
+            self.model.train(was_training)
+
+        assembled = assemble_captured_routing(calls, row_count).cpu()
+        scores = output.scores
+        if assembled.shape[1] != max_length + len(scores) - 1:
+            raise RuntimeError(
+                "路由记录的位置数对不上生成步数："
+                f"记录 {assembled.shape[1]}，提示词宽度 {max_length}，生成步数 {len(scores)}"
+            )
+
+        results = []
+        pad_token_id = generation_config.pad_token_id
+        generated_rows = output.sequences[:, max_length:]
+        for row_index, prompt in enumerate(prompts):
+            generated_token_ids = generated_rows[row_index].tolist()
+            if not self.stop_strings:
+                end_position = next(
+                    (position for position, token_id in enumerate(generated_token_ids)
+                     if token_id in self.end_token_ids), None)
+                if end_position is None:
+                    action_token_ids, truncated, finish_reason = generated_token_ids, True, "length_limit"
+                else:
+                    action_token_ids = generated_token_ids[:end_position + 1]
+                    truncated, finish_reason = False, "end_token"
+            else:
+                action_token_ids, finish_reason = parse_generated_tokens(
+                    generated_token_ids,
+                    self.end_token_ids,
+                    stop_strings=self.stop_strings,
+                    tokenizer=self.tokenizer,
+                    pad_token_id=pad_token_id,
+                    max_new_tokens=self.max_new_tokens,
+                )
+                truncated = finish_reason == "length_limit"
+            logprobs = []
+            for step, token_id in enumerate(action_token_ids):
+                distribution = torch.log_softmax(scores[step][row_index].float(), dim=-1)
+                logprobs.append(float(distribution[token_id]))
+            routing = align_generated_routing(
+                assembled[row_index], len(prompt), len(action_token_ids), max_length)
+            results.append((action_token_ids, truncated, logprobs, finish_reason, routing))
         return results
 
     @torch.no_grad()

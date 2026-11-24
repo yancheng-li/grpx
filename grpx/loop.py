@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import json
 import pathlib
@@ -352,6 +353,26 @@ def _average_weighted_metrics(weighted_metrics):
     }
 
 
+def _replay_agreement(statistics):
+    from grpx.routing_replay import merge_replay_statistics
+    present = [item for item in statistics if item is not None]
+    if not present:
+        return {}
+    return merge_replay_statistics(present)
+
+
+@contextlib.contextmanager
+def _replay_batch(model, batch):
+    """有专家记录时，这次前向和它的反向都强制使用记录的选择。没有记录就什么都不做。"""
+    routed = batch.get("routed_experts")
+    if routed is None:
+        yield None
+        return
+    from grpx.routing_replay import RoutingReplayer
+    with RoutingReplayer(model).replay(routed) as statistics:
+        yield statistics
+
+
 def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tracker=None,
                          accumulation=None):
     """各小批的损失按段权重之和的占比加权后累积梯度，结果等于全体段一次算出的梯度；返回按同样权重平均的指标。
@@ -377,18 +398,19 @@ def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tra
         if index < start_index:
             continue
         # 反向会重算前向，模式必须保持到 backward 结束；无梯度的前向不进这里
-        with gradient_bearing_forward(model):
-            new_log_probability, mask = action_log_probabilities(model, batch)
-            loss, metrics = grpo_loss(
-                new_log_probability, old_log_probability, mask, batch["advantages"],
-                row_weights=batch["row_weights"],
-                segment_ids=batch.get("segment_ids"),
-                segment_advantages=batch.get("segment_advantages"),
-                segment_weights=batch.get("segment_weights"),
-                **loss_options(config)
-            )
-            weight = batch_segment_weight(batch) / total_weight
-            (loss * weight).backward()
+        with _replay_batch(model, batch):
+            with gradient_bearing_forward(model):
+                new_log_probability, mask = action_log_probabilities(model, batch)
+                loss, metrics = grpo_loss(
+                    new_log_probability, old_log_probability, mask, batch["advantages"],
+                    row_weights=batch["row_weights"],
+                    segment_ids=batch.get("segment_ids"),
+                    segment_advantages=batch.get("segment_advantages"),
+                    segment_weights=batch.get("segment_weights"),
+                    **loss_options(config)
+                )
+                weight = batch_segment_weight(batch) / total_weight
+                (loss * weight).backward()
         if peak_tracker is not None:
             peak_tracker.note(batch, "backward")
         weighted_metrics.append((weight, metrics))
@@ -522,17 +544,28 @@ def _accumulate_on_replicas(group, models, batches, old_log_probabilities, assig
     def compute_minibatch_loss(model, index, device):
         batch = _batch_on_device(batches[index], device)
         old_log_probability = old_log_probabilities[index].to(device)
-        new_log_probability, mask = action_log_probabilities(model, batch)
-        loss, metrics = grpo_loss(
-            new_log_probability, old_log_probability, mask, batch["advantages"],
-            row_weights=batch["row_weights"],
-            segment_ids=batch.get("segment_ids"),
-            segment_advantages=batch.get("segment_advantages"),
-            segment_weights=batch.get("segment_weights"),
-            **loss_options(config),
-        )
+        # 反向在这个函数返回之后才发生。钩子要留到反向结束，检查点重算才用得到同一份记录
+        replay = _replay_batch(model, batch)
+        replay.__enter__()
+        try:
+            new_log_probability, mask = action_log_probabilities(model, batch)
+            loss, metrics = grpo_loss(
+                new_log_probability, old_log_probability, mask, batch["advantages"],
+                row_weights=batch["row_weights"],
+                segment_ids=batch.get("segment_ids"),
+                segment_advantages=batch.get("segment_advantages"),
+                segment_weights=batch.get("segment_weights"),
+                **loss_options(config),
+            )
+        except Exception:
+            replay.__exit__(None, None, None)
+            raise
         weight = batch_segment_weight(batch) / total_weight
-        return loss * weight, (weight, metrics)
+
+        def close_replay():
+            replay.__exit__(None, None, None)
+
+        return loss * weight, (weight, metrics), close_replay
 
     interval = accumulation["interval"] if accumulation is not None else 0
     waves = _accumulation_waves(len(batches), start_index, interval)
@@ -575,12 +608,16 @@ def _update_on_replicas(model, replicas, optimizer, batches, config, record_rout
 
             batch = _batch_on_device(batches[index], device)
             recorder = recorders.get(id(replica))
+            # 记录器先挂上，读到的是模型自己的选择；重放的钩子在它后面，改的是真正送去专家层的选择
             if recorder is None:
-                return action_log_probabilities(replica, batch)[0], None
+                with _replay_batch(replica, batch) as statistics:
+                    log_probability = action_log_probabilities(replica, batch)[0]
+                return log_probability, None, statistics
             snapshot = RoutingSnapshot()
             with recorder.record(batch["attention_mask"], snapshot=snapshot):
-                log_probability = action_log_probabilities(replica, batch)[0]
-            return log_probability, snapshot
+                with _replay_batch(replica, batch) as statistics:
+                    log_probability = action_log_probabilities(replica, batch)[0]
+            return log_probability, snapshot, statistics
 
         for replica in replicas:
             replica.eval()
@@ -591,6 +628,8 @@ def _update_on_replicas(model, replicas, optimizer, batches, config, record_rout
         routing_before = _merge_routing_snapshots(
             {index: old_parts[index][1] for index in range(len(batches))})
         gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
+        gap_metrics.update(_replay_agreement(
+            [old_parts[index][2] for index in range(len(batches))]))
 
         restore_caches = [suspend_kv_cache(replica) for replica in replicas]
         history = []
@@ -642,11 +681,13 @@ def _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing
             old_log_probability = old_log_probabilities[index].to(device)
             recorder = recorders.get(id(replica))
             if recorder is None:
-                new_log_probability, mask = action_log_probabilities(replica, batch)
+                with _replay_batch(replica, batch):
+                    new_log_probability, mask = action_log_probabilities(replica, batch)
                 return (new_log_probability - old_log_probability)[mask], None
             snapshot = RoutingSnapshot()
             with recorder.record(batch["attention_mask"], snapshot=snapshot):
-                new_log_probability, mask = action_log_probabilities(replica, batch)
+                with _replay_batch(replica, batch):
+                    new_log_probability, mask = action_log_probabilities(replica, batch)
             return (new_log_probability - old_log_probability)[mask], snapshot
 
         for replica in replicas:
@@ -754,14 +795,19 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
     model.eval()
     with torch.no_grad():         # 更新前，把所有小批的旧概率算出来
         old_log_probabilities = []
+        replay_statistics = []
         for batch in batches:
             if routing_recorder is not None:
                 with routing_recorder.record(batch["attention_mask"], snapshot=routing_before):
-                    old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+                    with _replay_batch(model, batch) as statistics:
+                        old_log_probabilities.append(action_log_probabilities(model, batch)[0])
             else:
-                old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+                with _replay_batch(model, batch) as statistics:
+                    old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+            replay_statistics.append(statistics)
             peak_tracker.note(batch, "old_log_probs")
     gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
+    gap_metrics.update(_replay_agreement(replay_statistics))
 
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
 
@@ -816,9 +862,11 @@ def measure_policy_shift(model, batches, old_log_probabilities, config, routing_
         for batch, old_log_probability in zip(batches, old_log_probabilities, strict=True):
             if routing_recorder is not None:
                 with routing_recorder.record(batch["attention_mask"], snapshot=routing_after):
-                    new_log_probability, mask = action_log_probabilities(model, batch)
+                    with _replay_batch(model, batch):
+                        new_log_probability, mask = action_log_probabilities(model, batch)
             else:
-                new_log_probability, mask = action_log_probabilities(model, batch)
+                with _replay_batch(model, batch):
+                    new_log_probability, mask = action_log_probabilities(model, batch)
             log_ratios.append((new_log_probability - old_log_probability)[mask])
     log_ratio = torch.cat(log_ratios).float()
     absolute_log_ratio = log_ratio.abs()
@@ -853,6 +901,11 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                 "正式训练请让每张卡只出现一次",
                 UserWarning,
             )
+    if config.routing_replay:
+        if not hasattr(backend, "record_routing"):
+            raise ValueError(
+                "routing_replay 只支持本地后端。vLLM 要能返回每一层选中的专家，才能重放")
+        backend.record_routing = True
     for replica in replicas:
         if config.gradient_checkpointing:
             gradient_checkpointing(replica, True)

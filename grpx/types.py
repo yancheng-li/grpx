@@ -21,6 +21,9 @@ class Step:
     environment_reward: float | None = None
     # 这一步生成的结束原因；旧轨迹 / 未填时为 None
     finish_reason: Optional[GenerationFinishReason] = None
+    # 采样时每层选中的专家，int8，形状 (提示+回答, 层数, 每 token 专家数)。
+    # 没有记录的位置是 -1。不重放时为 None
+    routed_experts: object | None = None
 
 @dataclass
 class Trajectory:

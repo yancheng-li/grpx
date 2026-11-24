@@ -54,6 +54,34 @@ def merged_trajectory_fraction(trajectories, units):
     return merged / mergeable
 
 
+def _routing_record(trajectory, token_length):
+    """这一行采样时记下的专家。多步还没合并时每行只有一步。没有记录则返回 None。"""
+    records = [getattr(step, "routed_experts", None) for step in trajectory.steps]
+    if all(record is None for record in records):
+        return None
+    if len(trajectory.steps) != 1 or records[0] is None:
+        raise ValueError("routing_replay 目前只支持单步的一行，不能把多步合成一行")
+    record = records[0]
+    if record.shape[0] != token_length:
+        raise ValueError(
+            f"专家记录有 {record.shape[0]} 个位置，这一行有 {token_length} 个 token")
+    return record
+
+
+def _stack_routing_records(records, max_length):
+    if all(record is None for record in records):
+        return None
+    if any(record is None for record in records):
+        raise ValueError("同一小批里有的行有专家记录，有的没有")
+    layers, experts = records[0].shape[1], records[0].shape[2]
+    stacked = torch.full((len(records), max_length, layers, experts), -1, dtype=torch.int8)
+    for row_index, record in enumerate(records):
+        if record.shape[1:] != (layers, experts):
+            raise ValueError("同一小批里各行的层数或专家数不一致")
+        stacked[row_index, :record.shape[0]] = record.to(torch.int8)
+    return stacked
+
+
 def build_batch(trajectories, padding_token_id, device, row_weighting="per_step"):
     """每条轨迹（或单步单元）是一行；多步且追加式时一行内多段回答。"""
     rows = []
@@ -103,12 +131,14 @@ def build_batch(trajectories, padding_token_id, device, row_weighting="per_step"
     row_advantages = []
     row_weights = []
     backend_urls = []
+    routing_rows = []
     segment_id = 0
     for row_index, (tokens, segments, _, backend_url) in enumerate(rows):
         length = len(tokens)
         input_token_ids[row_index, :length] = torch.tensor(tokens)
         attention_mask[row_index, :length] = 1
         backend_urls.append(backend_url)
+        routing_rows.append(_routing_record(trajectories[row_index], length))
         # 行级优势/权重：取第一段，供旧调用方兼容；真正损失用 segment_* 
         row_advantages.append(segments[0][2])
         row_weights.append(segments[0][3])
@@ -140,6 +170,9 @@ def build_batch(trajectories, padding_token_id, device, row_weighting="per_step"
         "sampling_log_probabilities": sampling_log_probabilities,
         "sampling_log_probability_mask": sampling_log_probability_mask,
     }
+    routed = _stack_routing_records(routing_rows, max_length)
+    if routed is not None:
+        batch["routed_experts"] = routed
     moved = {name: tensor.to(device) for name, tensor in batch.items()}
     moved["backend_urls"] = backend_urls
     return moved

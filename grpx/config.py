@@ -61,6 +61,8 @@ class TrainingConfig:
     memory_fraction: float = 0.6                 # 训练进程显存上限，对 devices 里的每张卡分别生效
     # 输出层按回答 token 分块做线性+CE，降低 (N, vocab) 峰值；None/0 表示不分块
     output_logit_chunk_size: int | None = 512
+    # 本地后端采样时记下每层选中的专家，训练前向强制使用同一选择。默认关。vLLM 还不支持
+    routing_replay: bool = False
 
     def __post_init__(self):
         for name in ("iterations", "groups_per_iteration", "max_rows_per_minibatch", "max_tokens_per_minibatch",
@@ -93,6 +95,11 @@ class TrainingConfig:
         if not isinstance(self.gradient_checkpointing, bool):
             raise ValueError(
                 f"gradient_checkpointing 必须是布尔值，收到 {self.gradient_checkpointing!r}")
+        if not isinstance(self.routing_replay, bool):
+            raise ValueError(f"routing_replay 必须是布尔值，收到 {self.routing_replay!r}")
+        if self.routing_replay and self.merge_append_only_turns:
+            raise ValueError(
+                "routing_replay 还不支持把多轮合并成一行（merge_append_only_turns）")
         if not isinstance(self.save_iteration_trajectories, bool):
             raise ValueError(
                 f"save_iteration_trajectories 必须是布尔值，收到 {self.save_iteration_trajectories!r}")

@@ -173,6 +173,7 @@ def test_saved_trajectories_round_trip_and_reject_weight_mismatch(tmp_path):
     assert loaded.content_hash == content_hash
     assert loaded.minibatch_plan == [[0], [1], [2], [3]]
     assert [step.advantage for step in loaded.kept[0].steps] == [1.0]
+    assert loaded.kept[0].steps[0].routed_experts is None
     assert generator.getstate() == python_state
     assert torch.equal(torch.get_rng_state(), torch_state)
 
@@ -184,3 +185,17 @@ def test_saved_trajectories_round_trip_and_reject_weight_mismatch(tmp_path):
         assert load_iteration_trajectories(
             tmp_path, 4, model, config, generator2, device="cpu") is None
     assert generator2.getstate() == before
+
+
+def test_saved_routing_round_trips_as_int8(tmp_path):
+    model = fresh_model()
+    rows = make_rows()
+    rows[0].steps[0].routed_experts = torch.tensor([[[0, 1], [-1, 3]]], dtype=torch.int8)
+    generator = random.Random(0)
+    save_iteration_trajectories(
+        tmp_path, 1, model, make_config(), rows, rows, {}, [[0]], generator, device="cpu")
+    loaded = load_iteration_trajectories(
+        tmp_path, 1, model, make_config(), random.Random(1), device="cpu")
+    restored = loaded.trajectories[0].steps[0].routed_experts
+    assert restored.dtype == torch.int8
+    assert torch.equal(restored, rows[0].steps[0].routed_experts)

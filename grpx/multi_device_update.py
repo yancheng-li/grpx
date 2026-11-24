@@ -178,8 +178,17 @@ class ReplicaGroup:
             collected: dict[int, Any] = {}
             with torch.enable_grad():
                 for index in minibatch_indices:
-                    loss, metrics = compute_minibatch_loss(model, index, device)
-                    loss.backward()
+                    result = compute_minibatch_loss(model, index, device)
+                    close_replay = None
+                    if len(result) == 3:
+                        loss, metrics, close_replay = result
+                    else:
+                        loss, metrics = result
+                    try:
+                        loss.backward()
+                    finally:
+                        if close_replay is not None:
+                            close_replay()
                     collected[index] = metrics
             return collected
 

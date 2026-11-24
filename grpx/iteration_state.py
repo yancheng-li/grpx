@@ -65,8 +65,25 @@ def make_fingerprint(config, iteration, content_hash, model):
     }
 
 
+def _routing_to_payload(routed_experts):
+    """int8 张量写成 JSON 能哈希的列表。没有记录时是 None。"""
+    if routed_experts is None:
+        return None
+    tensor = routed_experts.detach().cpu().to(torch.int8).contiguous()
+    return {"shape": list(tensor.shape), "values": tensor.view(-1).tolist()}
+
+
+def _routing_from_payload(payload):
+    if payload is None:
+        return None
+    if torch.is_tensor(payload):
+        return payload.detach().cpu().to(torch.int8).contiguous()
+    values = torch.tensor(payload["values"], dtype=torch.int8)
+    return values.view(payload["shape"])
+
+
 def _step_to_dict(step):
-    return {
+    payload = {
         "prompt_token_ids": list(step.prompt_token_ids),
         "action_token_ids": list(step.action_token_ids),
         "reward": step.reward,
@@ -77,6 +94,11 @@ def _step_to_dict(step):
         "environment_reward": step.environment_reward,
         "finish_reason": step.finish_reason,
     }
+    # 没有记录时不写这个键，这样关掉重放时轨迹哈希和原来一致
+    routed_experts = getattr(step, "routed_experts", None)
+    if routed_experts is not None:
+        payload["routed_experts"] = _routing_to_payload(routed_experts)
+    return payload
 
 
 def _step_from_dict(payload):
@@ -90,6 +112,7 @@ def _step_from_dict(payload):
         backend_base_url=payload["backend_base_url"],
         environment_reward=payload["environment_reward"],
         finish_reason=payload["finish_reason"],
+        routed_experts=_routing_from_payload(payload.get("routed_experts")),
     )
 
 

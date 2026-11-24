@@ -385,3 +385,23 @@ def test_stops_early_when_divergence_exceeds_limit():
     for parameter, reference_parameter in zip(model.parameters(),
                                               reference_model.parameters()):
         assert torch.equal(parameter, reference_parameter)   # 恰好只更新了一次
+
+
+def test_build_batch_places_routing_and_pads_with_missing():
+    record = torch.tensor([
+        [[1, 2], [0, 1]],
+        [[3, 4], [1, 0]],
+        [[-1, -1], [-1, -1]],
+    ], dtype=torch.int8)
+    short = Trajectory("g", 0, 1.0, steps=[Step([1, 2], [3], routed_experts=record)])
+    longer_record = torch.zeros((4, 2, 2), dtype=torch.int8)
+    longer = Trajectory("g", 0, 1.0, steps=[Step([4, 5], [6, 7], routed_experts=longer_record)])
+    batch = build_batch([short, longer], padding_token_id=0, device="cpu")
+    routed = batch["routed_experts"]
+    assert routed.shape == (2, 4, 2, 2)
+    assert routed.dtype == torch.int8
+    assert torch.equal(routed[0, :3], record)
+    assert torch.all(routed[0, 3] == -1)
+    assert torch.equal(routed[1], longer_record)
+    assert "routed_experts" not in build_batch(
+        [Trajectory("g", 0, 1.0, steps=[Step([1], [2])])], padding_token_id=0, device="cpu")
