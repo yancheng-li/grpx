@@ -4,7 +4,8 @@ from datetime import datetime
 from pathlib import Path
 
 SCIENTIFIC_NOTATION_FIELDS = {
-    "learning_rate", "shift_median_absolute_log_ratio", "approximate_kl"}
+    "learning_rate", "shift_median_absolute_log_ratio",
+    "shift_unreplayed_median_absolute_log_ratio", "approximate_kl"}
 
 def format_record(record):
     parts = []

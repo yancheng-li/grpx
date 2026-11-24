@@ -306,6 +306,136 @@ def test_dense_model_is_reported_unavailable():
     assert not RoutingReplayer(torch.nn.Linear(4, 4)).is_available
 
 
+def _training_batch(input_ids, attention_mask):
+    return {
+        "input_token_ids": input_ids,
+        "attention_mask": attention_mask,
+        "action_mask": torch.ones_like(input_ids, dtype=torch.bool),
+        "temperatures": torch.ones(input_ids.shape[0]),
+    }
+
+
+def test_routing_freeze_keeps_the_first_choice_after_the_gate_moves():
+    from grpx.config import TrainingConfig
+    from grpx.loop import consume_old_policy_forward
+
+    model = make_model("olmoe")
+    input_ids, attention_mask = make_batch()
+    batch = _training_batch(input_ids, attention_mask)
+    config = TrainingConfig(routing_freeze=True, updates_per_iteration=2)
+    _log_probability, statistics, frozen = consume_old_policy_forward(
+        model, batch, None, None, config)
+    assert statistics is None
+    assert frozen is not None and frozen.dtype == torch.int8
+    assert torch.equal(batch["routed_experts"], frozen)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if name.endswith("gate.weight"):
+                # 每个专家加不同的偏置。全体加同一个常数不会改变排序
+                parameter.zero_()
+                parameter[:, 0] = torch.arange(parameter.shape[0], dtype=parameter.dtype)
+    native_after, _logits = native_routing(model, input_ids, attention_mask)
+    assert not torch.equal(native_after.sort(dim=-1).values, frozen.long().sort(dim=-1).values)
+    capture = RoutingCapture(model)
+    with RoutingReplayer(model).replay(frozen), capture.capture() as calls, torch.no_grad():
+        model(input_ids=input_ids, attention_mask=attention_mask)
+    effective = assemble_captured_routing(calls, input_ids.shape[0])
+    assert torch.equal(effective.sort(dim=-1).values, frozen.long().sort(dim=-1).values)
+
+
+def test_routing_freeze_leaves_a_sampler_record_untouched():
+    from grpx.config import TrainingConfig
+    from grpx.loop import consume_old_policy_forward
+
+    model = make_model("olmoe")
+    input_ids, attention_mask = make_batch()
+    batch = _training_batch(input_ids, attention_mask)
+    sampler_record = torch.tensor([0, 1], dtype=torch.int8).repeat(
+        input_ids.shape[0], input_ids.shape[1], LAYER_COUNT, 1)
+    batch["routed_experts"] = sampler_record
+    config = TrainingConfig(routing_freeze=True, routing_replay=True, updates_per_iteration=2)
+    _log_probability, statistics, frozen = consume_old_policy_forward(
+        model, batch, None, None, config)
+    assert frozen is None
+    assert batch["routed_experts"] is sampler_record
+    assert statistics is not None
+
+
+def test_routing_freeze_rejects_a_dense_model():
+    from grpx.config import TrainingConfig
+    from grpx.loop import consume_old_policy_forward
+
+    batch = {"input_token_ids": torch.zeros(1, 2, dtype=torch.long)}
+    config = TrainingConfig(routing_freeze=True, updates_per_iteration=2)
+    with pytest.raises(RuntimeError, match="routing_freeze"):
+        consume_old_policy_forward(torch.nn.Linear(4, 4), batch, None, None, config)
+
+
+def test_routing_freeze_must_be_boolean():
+    from grpx.config import TrainingConfig
+    with pytest.raises(ValueError, match="routing_freeze"):
+        TrainingConfig(routing_freeze="yes")
+
+
+def test_routing_freeze_is_idle_for_a_single_update():
+    from grpx.config import TrainingConfig
+    from grpx.loop import consume_old_policy_forward
+
+    model = make_model("olmoe")
+    input_ids, attention_mask = make_batch()
+    batch = _training_batch(input_ids, attention_mask)
+    config = TrainingConfig(routing_freeze=True, updates_per_iteration=1)
+    _log_probability, statistics, frozen = consume_old_policy_forward(
+        model, batch, None, None, config)
+    assert frozen is None
+    assert "routed_experts" not in batch
+    assert statistics is None
+
+
+def test_unreplayed_shift_ignores_a_forced_expert_record():
+    from grpx.config import TrainingConfig
+    from grpx.loop import measure_policy_shift
+    from grpx.trainer import action_log_probabilities, build_batch
+    from grpx.types import Step, Trajectory
+
+    model = make_model("olmoe")
+    trajectory = Trajectory("g", 0, 1.0, steps=[Step([1, 2, 3], [4, 5, 6], advantage=1.0)])
+    batch = build_batch([trajectory], padding_token_id=0, device=model.device)
+    with torch.no_grad():
+        old_log_probability, _mask = action_log_probabilities(model, batch)
+    routing, _logits = native_routing(model, batch["input_token_ids"], batch["attention_mask"])
+    batch["routed_experts"] = different_routing(routing).to(torch.int8)
+    config = TrainingConfig()
+    replayed = measure_policy_shift(model, [batch], [old_log_probability], config, replay=True)
+    native = measure_policy_shift(model, [batch], [old_log_probability], config, replay=False)
+    assert native["shift_percentile_95_absolute_log_ratio"] < 1e-5
+    assert replayed["shift_percentile_95_absolute_log_ratio"] > 1e-3
+
+
+def test_freeze_measurement_script_runs_on_cpu():
+    import importlib.util
+    from pathlib import Path
+
+    from grpx.config import TrainingConfig
+    from grpx.types import Step, Trajectory
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "measure_routing_freeze.py"
+    spec = importlib.util.spec_from_file_location("measure_routing_freeze", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    model = make_model("olmoe")
+    kept = [
+        Trajectory("g", 0, 1.0, steps=[Step([1, 2, 3], [4, 5, 6], advantage=1.0)]),
+        Trajectory("g", 1, 1.0, steps=[Step([7, 8], [9, 10, 11], advantage=-1.0)]),
+    ]
+    config = TrainingConfig(learning_rate=1e-4, updates_per_iteration=2)
+    for freeze in (False, True):
+        result = module.measure_condition(model, kept, 0, config, freeze)
+        assert result["n_tokens"] > 0
+        assert "clip_fraction" in result
+        assert "p95_absolute_log_ratio" in result
+
+
 def test_align_generated_routing_keeps_prompt_and_drops_the_last_token():
     # 左填充 1 个位置，提示词 2 个，再喂回 2 个生成 token。最后一个回答 token 没有记录
     assembled = torch.arange(5 * 2 * 2).reshape(5, 2, 2)

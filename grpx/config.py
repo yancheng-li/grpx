@@ -63,6 +63,11 @@ class TrainingConfig:
     output_logit_chunk_size: int | None = 512
     # 本地后端采样时记下每层选中的专家，训练前向强制使用同一选择。默认关。vLLM 还不支持
     routing_replay: bool = False
+    # 同一批数据更新多步时，固定使用更新前那一次前向自己选的专家。默认关。
+    # 已经有采样记录时不再生效，那次记录会贯穿每一步。
+    routing_freeze: bool = False
+    # 测位移时再做一次不重放的前向，记下模型自己选专家时的变化。默认关。
+    measure_unreplayed_shift: bool = False
 
     def __post_init__(self):
         for name in ("iterations", "groups_per_iteration", "max_rows_per_minibatch", "max_tokens_per_minibatch",
@@ -97,6 +102,11 @@ class TrainingConfig:
                 f"gradient_checkpointing 必须是布尔值，收到 {self.gradient_checkpointing!r}")
         if not isinstance(self.routing_replay, bool):
             raise ValueError(f"routing_replay 必须是布尔值，收到 {self.routing_replay!r}")
+        if not isinstance(self.routing_freeze, bool):
+            raise ValueError(f"routing_freeze 必须是布尔值，收到 {self.routing_freeze!r}")
+        if not isinstance(self.measure_unreplayed_shift, bool):
+            raise ValueError(
+                f"measure_unreplayed_shift 必须是布尔值，收到 {self.measure_unreplayed_shift!r}")
         if self.routing_replay and self.merge_append_only_turns:
             raise ValueError(
                 "routing_replay 还不支持把多轮合并成一行（merge_append_only_turns）")

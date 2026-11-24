@@ -88,7 +88,7 @@ SHIFT_FIELDS = (
 )
 
 
-def run_training(tmp_path, name, iterations, interval, seed=0):
+def run_training(tmp_path, name, iterations, interval, seed=0, measure_unreplayed_shift=False):
     torch.manual_seed(seed)
     model = TinyLanguageModel()
     config = TrainingConfig(
@@ -97,6 +97,7 @@ def run_training(tmp_path, name, iterations, interval, seed=0):
         warmup_iterations=1, checkpoint_interval=10,
         evaluation_interval=10, max_steps=1, seed=seed,
         shift_measurement_interval=interval,
+        measure_unreplayed_shift=measure_unreplayed_shift,
         output_root=str(tmp_path), run_name=name,
         learning_rate=1e-3,
     )
@@ -142,6 +143,25 @@ def test_shift_measurement_does_not_change_trainable_params_or_loss(tmp_path):
                for record in records_every if "loss" in record)
     assert all(not any(name in record for name in SHIFT_FIELDS)
                for record in records_never if "loss" in record)
+
+
+def test_unreplayed_shift_is_logged_only_when_enabled(tmp_path):
+    _model, records = run_training(
+        tmp_path, "shift-both", iterations=2, interval=1, measure_unreplayed_shift=True)
+    training = [record for record in records if "loss" in record]
+    assert training
+    for record in training:
+        assert "shift_unreplayed_clip_fraction" in record
+        assert "shift_unreplayed_percentile_95_absolute_log_ratio" in record
+        assert record["shift_unreplayed_clip_fraction"] == record["shift_clip_fraction"]
+    _model, plain = run_training(tmp_path, "shift-one", iterations=1, interval=1)
+    logged = [record for record in plain if "loss" in record]
+    assert logged and "shift_unreplayed_clip_fraction" not in logged[0]
+
+
+def test_measure_unreplayed_shift_must_be_boolean():
+    with pytest.raises(ValueError, match="measure_unreplayed_shift"):
+        TrainingConfig(measure_unreplayed_shift="yes")
 
 
 def test_measure_policy_shift_leaves_params_and_rng_unchanged():

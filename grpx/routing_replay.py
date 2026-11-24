@@ -268,6 +268,18 @@ def merge_replay_statistics(parts: Sequence[ReplayStatistics]) -> dict[str, floa
     }
 
 
+def capture_training_routing(calls: dict[str, Sequence[torch.Tensor]], batch_size: int, sequence_length: int) -> torch.Tensor:
+    """一次完整训练前向里各层实际选中的专家。int8，形状 (批, 序列, 层, 每个 token 的专家数)。"""
+    assembled = assemble_captured_routing(calls, batch_size)
+    if assembled.shape[1] != sequence_length:
+        raise RuntimeError(
+            f"训练前向的路由记录有 {assembled.shape[1]} 个位置，序列长度是 {sequence_length}"
+        )
+    if assembled.numel() and int(assembled.max()) > 127:
+        raise ValueError("专家编号超过 127，单字节存不下")
+    return assembled.to(torch.int8)
+
+
 def assemble_captured_routing(calls: dict[str, Sequence[torch.Tensor]], batch_size: int) -> torch.Tensor:
     """把按调用顺序记录的编号拼成 (批大小, 位置数, 层数, 每个 token 选几个专家)。
 

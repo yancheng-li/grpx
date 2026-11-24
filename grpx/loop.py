@@ -361,8 +361,55 @@ def _replay_agreement(statistics):
     return merge_replay_statistics(present)
 
 
+def _should_freeze_routing(config, batch):
+    """多步更新、且这批没有采样时的专家记录，才固定训练端自己的选择。"""
+    return (
+        config.routing_freeze
+        and config.updates_per_iteration > 1
+        and batch.get("routed_experts") is None
+    )
+
+
+def consume_old_policy_forward(model, batch, recorder, snapshot, config):
+    """算更新前的旧策略概率。
+
+    需要固定路由时，这次前向不重放，把模型自己的选择记到 batch 上，
+    后面的更新步和步长测量会重放它。已有采样记录时走原来的重放。
+    返回 (对数概率, 重放统计或 None, 新记下的专家或 None)。
+    """
+    if _should_freeze_routing(config, batch):
+        from grpx.routing_replay import RoutingCapture, RoutingReplayer, capture_training_routing
+        if not RoutingReplayer(model).is_available:
+            raise RuntimeError("routing_freeze 只适用于带路由的模型")
+        capture = RoutingCapture(model)
+        if recorder is None:
+            with capture.capture() as calls:
+                log_probability = _forward_for_log_probability(model, batch)
+        else:
+            with recorder.record(batch["attention_mask"], snapshot=snapshot):
+                with capture.capture() as calls:
+                    log_probability = _forward_for_log_probability(model, batch)
+        frozen = capture_training_routing(
+            calls, batch["input_token_ids"].shape[0], batch["input_token_ids"].shape[1])
+        batch["routed_experts"] = frozen
+        return log_probability, None, frozen
+    # 记录器在重放外面，读到的是模型自己的选择；重放只改送进专家层的那一份
+    if recorder is None:
+        with replay_batch(model, batch) as statistics:
+            log_probability = _forward_for_log_probability(model, batch)
+        return log_probability, statistics, None
+    with recorder.record(batch["attention_mask"], snapshot=snapshot):
+        with replay_batch(model, batch) as statistics:
+            log_probability = _forward_for_log_probability(model, batch)
+    return log_probability, statistics, None
+
+
+def _forward_for_log_probability(model, batch):
+    return action_log_probabilities(model, batch)[0]
+
+
 @contextlib.contextmanager
-def _replay_batch(model, batch):
+def replay_batch(model, batch):
     """有专家记录时，这次前向和它的反向都强制使用记录的选择。没有记录就什么都不做。"""
     routed = batch.get("routed_experts")
     if routed is None:
@@ -398,7 +445,7 @@ def accumulate_gradients(model, batches, old_log_probabilities, config, peak_tra
         if index < start_index:
             continue
         # 反向会重算前向，模式必须保持到 backward 结束；无梯度的前向不进这里
-        with _replay_batch(model, batch):
+        with replay_batch(model, batch):
             with gradient_bearing_forward(model):
                 new_log_probability, mask = action_log_probabilities(model, batch)
                 loss, metrics = grpo_loss(
@@ -545,7 +592,7 @@ def _accumulate_on_replicas(group, models, batches, old_log_probabilities, assig
         batch = _batch_on_device(batches[index], device)
         old_log_probability = old_log_probabilities[index].to(device)
         # 反向在这个函数返回之后才发生。钩子要留到反向结束，检查点重算才用得到同一份记录
-        replay = _replay_batch(model, batch)
+        replay = replay_batch(model, batch)
         replay.__enter__()
         try:
             new_log_probability, mask = action_log_probabilities(model, batch)
@@ -608,20 +655,18 @@ def _update_on_replicas(model, replicas, optimizer, batches, config, record_rout
 
             batch = _batch_on_device(batches[index], device)
             recorder = recorders.get(id(replica))
-            # 记录器先挂上，读到的是模型自己的选择；重放的钩子在它后面，改的是真正送去专家层的选择
-            if recorder is None:
-                with _replay_batch(replica, batch) as statistics:
-                    log_probability = action_log_probabilities(replica, batch)[0]
-                return log_probability, None, statistics
-            snapshot = RoutingSnapshot()
-            with recorder.record(batch["attention_mask"], snapshot=snapshot):
-                with _replay_batch(replica, batch) as statistics:
-                    log_probability = action_log_probabilities(replica, batch)[0]
-            return log_probability, snapshot, statistics
+            snapshot = RoutingSnapshot() if recorder is not None else None
+            log_probability, statistics, frozen = consume_old_policy_forward(
+                replica, batch, recorder, snapshot, config)
+            return log_probability, snapshot, statistics, frozen
 
         for replica in replicas:
             replica.eval()
         old_parts = group.map_without_gradient(assignment, compute_old_log_probability)
+        for index in range(len(batches)):
+            frozen = old_parts[index][3]
+            if frozen is not None:
+                batches[index]["routed_experts"] = frozen
         primary_device = batches[0]["input_token_ids"].device
         old_log_probabilities = [
             old_parts[index][0].to(primary_device) for index in range(len(batches))]
@@ -666,7 +711,7 @@ def _update_on_replicas(model, replicas, optimizer, batches, config, record_rout
         group.close()
 
 
-def _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing_before):
+def _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing_before, replay=True):
     devices = [replica.device for replica in replicas]
     group = ReplicaGroup(replicas, devices)
     try:
@@ -681,13 +726,11 @@ def _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing
             old_log_probability = old_log_probabilities[index].to(device)
             recorder = recorders.get(id(replica))
             if recorder is None:
-                with _replay_batch(replica, batch):
-                    new_log_probability, mask = action_log_probabilities(replica, batch)
+                new_log_probability, mask = _forward_for_shift(replica, batch, replay)
                 return (new_log_probability - old_log_probability)[mask], None
             snapshot = RoutingSnapshot()
             with recorder.record(batch["attention_mask"], snapshot=snapshot):
-                with _replay_batch(replica, batch):
-                    new_log_probability, mask = action_log_probabilities(replica, batch)
+                new_log_probability, mask = _forward_for_shift(replica, batch, replay)
             return (new_log_probability - old_log_probability)[mask], snapshot
 
         for replica in replicas:
@@ -797,13 +840,9 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
         old_log_probabilities = []
         replay_statistics = []
         for batch in batches:
-            if routing_recorder is not None:
-                with routing_recorder.record(batch["attention_mask"], snapshot=routing_before):
-                    with _replay_batch(model, batch) as statistics:
-                        old_log_probabilities.append(action_log_probabilities(model, batch)[0])
-            else:
-                with _replay_batch(model, batch) as statistics:
-                    old_log_probabilities.append(action_log_probabilities(model, batch)[0])
+            log_probability, statistics, _frozen = consume_old_policy_forward(
+                model, batch, routing_recorder, routing_before, config)
+            old_log_probabilities.append(log_probability)
             replay_statistics.append(statistics)
             peak_tracker.note(batch, "old_log_probs")
     gap_metrics = measure_backend_log_probability_gap(batches, old_log_probabilities)
@@ -838,15 +877,24 @@ def update_policy(model, optimizer, kept, padding_token_id, config, record_routi
     return (history, batches, old_log_probabilities, gap_metrics, merge_fraction,
             peak_tracker.best, oversized_stats, routing_before)
 
+def _forward_for_shift(model, batch, replay):
+    if not replay:
+        return action_log_probabilities(model, batch)
+    with replay_batch(model, batch):
+        return action_log_probabilities(model, batch)
+
+
 def measure_policy_shift(model, batches, old_log_probabilities, config, routing_before=None,
-                         replicas=None):
+                         replicas=None, replay=True):
     """更新之后对所有小批再做一遍无梯度前向，把回答位置的对数比值收集到一起，统一算分位数。
 
     必须复用 update_policy 里算旧对数概率时的同一批 tensors（切分、顺序、补齐都相同）。
     另建小批会在 bf16 下引入与学习率无关的路径差，把位移指标打成底噪。
-    若传入 routing_before（来自同一次 update_policy 的旧概率前向），顺带汇总路由变化。"""
+    若传入 routing_before（来自同一次 update_policy 的旧概率前向），顺带汇总路由变化。
+    replay 为假时不使用批次上的专家记录，量的是模型自己选专家时的变化。"""
     if replicas is not None and len(replicas) > 1:
-        return _shift_on_replicas(replicas, batches, old_log_probabilities, config, routing_before)
+        return _shift_on_replicas(
+            replicas, batches, old_log_probabilities, config, routing_before, replay=replay)
     model.eval()
     log_ratios = []
     routing_after = None
@@ -862,11 +910,9 @@ def measure_policy_shift(model, batches, old_log_probabilities, config, routing_
         for batch, old_log_probability in zip(batches, old_log_probabilities, strict=True):
             if routing_recorder is not None:
                 with routing_recorder.record(batch["attention_mask"], snapshot=routing_after):
-                    with _replay_batch(model, batch):
-                        new_log_probability, mask = action_log_probabilities(model, batch)
+                    new_log_probability, mask = _forward_for_shift(model, batch, replay)
             else:
-                with _replay_batch(model, batch):
-                    new_log_probability, mask = action_log_probabilities(model, batch)
+                new_log_probability, mask = _forward_for_shift(model, batch, replay)
             log_ratios.append((new_log_probability - old_log_probability)[mask])
     log_ratio = torch.cat(log_ratios).float()
     absolute_log_ratio = log_ratio.abs()
@@ -1065,6 +1111,15 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                             model, batches, old_log_probabilities, config,
                             routing_before=routing_before,
                             replicas=replicas_for_update))
+                        if config.measure_unreplayed_shift:
+                            unreplayed = measure_policy_shift(
+                                model, batches, old_log_probabilities, config,
+                                replicas=replicas_for_update, replay=False)
+                            record["shift_unreplayed_clip_fraction"] = unreplayed["shift_clip_fraction"]
+                            record["shift_unreplayed_median_absolute_log_ratio"] = unreplayed[
+                                "shift_median_absolute_log_ratio"]
+                            record["shift_unreplayed_percentile_95_absolute_log_ratio"] = unreplayed[
+                                "shift_percentile_95_absolute_log_ratio"]
                         shift_seconds = time.perf_counter() - shift_start
                     scheduler.step()
                     # 位移前向从 update_seconds 拆出，便于不同间隔之间比较更新耗时
