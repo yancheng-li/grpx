@@ -948,10 +948,15 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                 UserWarning,
             )
     if config.routing_replay:
-        if not hasattr(backend, "record_routing"):
+        if hasattr(backend, "probe_routed_experts"):
+            backend.probe_routed_experts(replicas[0])
+            backend.record_routing = True
+        elif hasattr(backend, "record_routing"):
+            backend.record_routing = True
+        else:
             raise ValueError(
-                "routing_replay 只支持本地后端。vLLM 要能返回每一层选中的专家，才能重放")
-        backend.record_routing = True
+                "routing_replay 需要采样后端能返回每一层选中的专家。"
+                "本地后端可以直接记；vLLM 要 0.34.0 并用 --enable-return-routed-experts 启动")
     for replica in replicas:
         if config.gradient_checkpointing:
             gradient_checkpointing(replica, True)
@@ -977,7 +982,12 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
     if hasattr(backend, "adapter_directory"):
         backend.adapter_directory = run_directory / "vllm_adapter"
 
-    if resolved_configuration is not None:
+    if hasattr(backend, "server_versions"):
+        snapshot = dict(resolved_configuration or {})
+        snapshot["vllm_server_versions"] = backend.server_versions()
+        (run_directory / "resolved_configuration.json").write_text(
+            json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
+    elif resolved_configuration is not None:
         (run_directory / "resolved_configuration.json").write_text(
             json.dumps(resolved_configuration, indent=2, ensure_ascii=False), encoding="utf-8")
 

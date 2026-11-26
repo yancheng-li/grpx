@@ -138,6 +138,10 @@ class VllmBackend:
         self._active_adapter_directory = None
         self._cleared_stale_adapters = False
         self._verified_server_base = False
+        # 只有 routing_replay 打开时才会在采样响应里读取专家记录。贪心评测不读。
+        self.record_routing = False
+        self.routing_layer_count = None
+        self.routing_experts_per_token = None
 
     @property
     def base_url_count(self):
@@ -491,6 +495,57 @@ class VllmBackend:
                 ) from None
         return token_ids
 
+    def server_versions(self):
+        """每个推理服务的版本号，写进运行配置，便于以后对上是哪个 vLLM。"""
+        versions = []
+        for url in self.base_urls:
+            response = self._request("GET", f"{url}/version", None)
+            payload = response.json()
+            version = payload.get("version") if isinstance(payload, dict) else None
+            if not version:
+                raise RuntimeError(f"推理服务没有返回版本号：{url}")
+            versions.append({"base_url": url, "version": str(version)})
+        return versions
+
+    def probe_routed_experts(self, model):
+        """重放打开时，先打一条请求。响应里没有路由字段就停，不进入训练。"""
+        from grpx.routing_replay import (
+            _router_attribute,
+            decode_vllm_routed_experts,
+            find_router_modules,
+        )
+
+        modules = find_router_modules(model)
+        if not modules:
+            raise RuntimeError("routing_replay 只适用于带路由的模型")
+        layer_count = len(modules)
+        experts_per_token = int(_router_attribute(next(iter(modules.values())), "top_k"))
+        self.routing_layer_count = layer_count
+        self.routing_experts_per_token = experts_per_token
+        prompt = [1, 2, 3, 4]
+        for url in self.base_urls:
+            response = self._request("POST", f"{url}/v1/completions", {
+                "model": self.expected_base_model,
+                "prompt": prompt,
+                "n": 1,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "logprobs": 1,
+                "return_tokens_as_token_ids": True,
+            })
+            choice = response.json()["choices"][0]
+            token_ids = self._parse_token_ids(choice)
+            if not token_ids:
+                raise RuntimeError(f"探测路由时推理服务没有返回 token：{url}")
+            decode_vllm_routed_experts(
+                choice.get("routed_experts"),
+                len(prompt),
+                len(token_ids),
+                layer_count,
+                experts_per_token,
+            )
+
     def _complete(self, prompt_token_ids, number_of_samples, greedy, base_url=None):
         # vLLM 贪心采样要求 n=1；评测时多条轨迹常共享同一开场提示词，会被合并成 n>1。
         # 贪心结果确定，请求一次后复制即可。
@@ -525,6 +580,7 @@ class VllmBackend:
             logprobs = choice.get("logprobs") or {}
             token_logprobs = list(logprobs.get("token_logprobs") or [])
             stop_reason = choice.get("stop_reason")
+            server_action_length = len(token_ids)
             if api_finish_reason == "length":
                 finish_reason = "length_limit"
                 was_truncated = True
@@ -548,7 +604,23 @@ class VllmBackend:
                 token_logprobs = token_logprobs + [None] * (len(token_ids) - len(token_logprobs))
             elif len(token_logprobs) > len(token_ids):
                 token_logprobs = token_logprobs[:len(token_ids)]
-            if self.stop_strings:
+            routed_experts = None
+            if self.record_routing and not greedy:
+                if self.routing_layer_count is None or self.routing_experts_per_token is None:
+                    raise RuntimeError("还没有确认推理服务会返回路由")
+                from grpx.routing_replay import decode_vllm_routed_experts
+                routed_experts = decode_vllm_routed_experts(
+                    choice.get("routed_experts"),
+                    len(prompt_token_ids),
+                    server_action_length,
+                    self.routing_layer_count,
+                    self.routing_experts_per_token,
+                    extra_unrecorded=len(token_ids) - server_action_length,
+                )
+            if routed_experts is not None:
+                results.append((
+                    token_ids, was_truncated, token_logprobs, finish_reason, routed_experts))
+            elif self.stop_strings:
                 results.append((token_ids, was_truncated, token_logprobs, finish_reason))
             else:
                 # 停止串为空时保持旧三元组，同批对照不变

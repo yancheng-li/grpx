@@ -21,10 +21,13 @@ assemble_captured_routing 把它们拼成上面的形状。
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import io
 from dataclasses import dataclass, field
 from typing import Iterator, Sequence
 
+import numpy as np
 import torch
 
 
@@ -203,6 +206,76 @@ class RoutingCapture:
         finally:
             for handle in handles:
                 handle.remove()
+
+
+def decode_vllm_routed_experts(
+    encoded,
+    prompt_length: int,
+    action_length: int,
+    layer_count: int,
+    experts_per_token: int,
+    extra_unrecorded: int = 0,
+) -> torch.Tensor:
+    """把 /v1/completions 里的 base64 .npy 填进训练用的 int8 记录。
+
+    服务端的行数是提示词加回答再减 1，和 RoutingCapture 记的范围一样：
+    所有输入过模型的 token。最后一个采样出的 token 没有记录，末尾补一行 -1。
+    本地另外补上的结束符也没有记录，用 extra_unrecorded 再补几行 -1。
+    """
+    if not isinstance(encoded, str) or not encoded:
+        raise RuntimeError(
+            "推理服务没有返回 routed_experts。"
+            "vLLM 0.18 的 HTTP 响应里没有这个字段；"
+            "需要 0.34.0，并用 --enable-return-routed-experts 启动。"
+        )
+    try:
+        array = np.load(io.BytesIO(base64.b64decode(encoded)), allow_pickle=False)
+    except Exception as error:
+        raise RuntimeError(f"routed_experts 不是关掉 pickle 也能读的 .npy：{error}") from error
+    routing = _routing_from_vllm_array(
+        np.asarray(array), prompt_length, action_length, layer_count, experts_per_token)
+    if extra_unrecorded < 0:
+        raise ValueError(f"extra_unrecorded 不能为负，收到 {extra_unrecorded}")
+    if extra_unrecorded:
+        padding = torch.full(
+            (extra_unrecorded, routing.shape[1], routing.shape[2]), -1, dtype=torch.int8)
+        routing = torch.cat((routing, padding), dim=0)
+    return routing
+
+
+def _routing_from_vllm_array(
+    array: np.ndarray,
+    prompt_length: int,
+    action_length: int,
+    layer_count: int,
+    experts_per_token: int,
+) -> torch.Tensor:
+    if array.ndim != 3:
+        raise ValueError(f"路由记录应为三维数组，收到形状 {array.shape}")
+    expected_rows = prompt_length + action_length - 1
+    if array.shape[0] != expected_rows:
+        raise ValueError(
+            f"路由记录有 {array.shape[0]} 行，"
+            f"提示词 {prompt_length} 加回答 {action_length} 应是 {expected_rows} 行"
+        )
+    if array.shape[1] != layer_count:
+        raise ValueError(f"路由记录有 {array.shape[1]} 层，训练端找到 {layer_count} 个路由模块")
+    if array.shape[2] != experts_per_token:
+        raise ValueError(
+            f"路由记录里每个 token 有 {array.shape[2]} 个专家，"
+            f"模型每个 token 选 {experts_per_token} 个"
+        )
+    if array.size and int(array.min()) < 0:
+        raise ValueError("路由记录里出现了负数编号")
+    if array.size and int(array.max()) > 127:
+        raise ValueError(
+            f"专家编号最大是 {int(array.max())}，超过 127，有符号单字节会把它当成没有记录"
+        )
+    routing = torch.full(
+        (prompt_length + action_length, layer_count, experts_per_token), -1, dtype=torch.int8)
+    if expected_rows:
+        routing[:expected_rows] = torch.as_tensor(array).to(torch.int8)
+    return routing
 
 
 def align_generated_routing(

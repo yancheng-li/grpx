@@ -612,6 +612,93 @@ def test_unexpected_token_format_raises_readable_error(tmp_path, monkeypatch):
         backend.generate([10], 1)
 
 
+def _npy_b64(array):
+    import base64
+    import io
+    import numpy as np
+    buffer = io.BytesIO()
+    np.save(buffer, array)
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def test_record_routing_decodes_each_choice_and_pads_a_local_end_token(tmp_path, monkeypatch):
+    import numpy as np
+    backend = make_backend(tmp_path)
+    backend.record_routing = True
+    backend.routing_layer_count = 2
+    backend.routing_experts_per_token = 2
+    prompt = [10, 11]
+    first = np.arange(3 * 2 * 2, dtype=np.uint8).reshape(3, 2, 2)
+    second = np.full((3, 2, 2), 7, dtype=np.uint8)
+
+    def handler(method, url, payload, timeout):
+        assert payload["n"] == 2
+        return FakeResponse({"choices": [
+            {**make_choice(1, [9, 8], finish_reason="stop", stop_reason=END_TOKEN_ID),
+             "routed_experts": _npy_b64(second)},
+            {**make_choice(0, [5, 6], finish_reason="stop", stop_reason=END_TOKEN_ID),
+             "routed_experts": _npy_b64(first)},
+        ]})
+
+    patch_request(monkeypatch, handler)
+    samples = backend.generate_batch([(prompt, 2)])[0]
+    assert [sample[0] for sample in samples] == [
+        [5, 6, END_TOKEN_ID], [9, 8, END_TOKEN_ID]]
+    # 提示词 2 + 服务端回答 2 = 4 行记录，本地补的结束符再占一行 -1
+    assert samples[0][4].shape == (5, 2, 2)
+    assert int(samples[0][4][0, 0, 0]) == 0
+    assert int(samples[0][4][-2, 0, 0]) == -1
+    assert int(samples[0][4][-1, 0, 0]) == -1
+    assert int(samples[1][4][0, 0, 0]) == 7
+
+
+def test_record_routing_rejects_a_response_without_the_field(tmp_path, monkeypatch):
+    backend = make_backend(tmp_path)
+    backend.record_routing = True
+    backend.routing_layer_count = 2
+    backend.routing_experts_per_token = 2
+    patch_request(monkeypatch, lambda method, url, payload, timeout: FakeResponse(
+        {"choices": [make_choice(0, [5, END_TOKEN_ID])]}))
+    with pytest.raises(RuntimeError, match="routed_experts"):
+        backend.generate_batch([([10], 1)])
+
+
+def test_greedy_does_not_read_routing_even_when_recording_is_enabled(tmp_path, monkeypatch):
+    backend = make_backend(tmp_path)
+    backend.record_routing = True
+    backend.routing_layer_count = 2
+    backend.routing_experts_per_token = 2
+    patch_request(monkeypatch, lambda method, url, payload, timeout: FakeResponse(
+        {"choices": [make_choice(0, [END_TOKEN_ID])]}))
+    sample = backend.generate_batch([([10], 1)], greedy=True)[0][0]
+    assert len(sample) == 3
+
+
+def test_probe_stops_when_the_server_omits_routing(tmp_path, monkeypatch):
+    from torch import nn
+
+    class Gate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.top_k = 2
+            self.num_experts = 4
+            self.norm_topk_prob = False
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = nn.Module()
+            self.block.gate = Gate()
+
+    backend = make_backend(tmp_path)
+    patch_request(monkeypatch, lambda method, url, payload, timeout: FakeResponse(
+        {"choices": [make_choice(0, [5])]}))
+    with pytest.raises(RuntimeError, match="routed_experts"):
+        backend.probe_routed_experts(Model())
+    assert backend.routing_layer_count == 1
+    assert backend.routing_experts_per_token == 2
+
+
 def test_unknown_finish_reason_raises(tmp_path, monkeypatch):
     backend = make_backend(tmp_path)
 
