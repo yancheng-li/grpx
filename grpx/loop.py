@@ -89,7 +89,10 @@ def collect_trajectories(
 # 第 0 轮 LoRA 增量近零，中位数应只差精度（千分之几）；超过 0.05 视为训推不是同一模型。
 # 尾部用「差超过 1」的比例。普通模型上，配置正确时这个比例在 0 到约 0.6%，
 # 最大差到过 1.6；配置错位（例如 RoPE 用了默认 10000）时比例是 2%–4%，最大差 5–11。
-# 警告线 0.3%、硬失败 1%，两边各留出余量。限度按普通模型定，MoE 上还没有校准。
+# 警告线 0.3%、硬失败 1%，两边各留出余量。
+# MoE 且没有打开 routing_replay 时，两端专家选择不同，这个比例第一轮就是 3%–4%，
+# 单轮到过 6.9%。这时不拿占比中止，只警告；中位数和最大差的硬限度照旧。
+# 重放打开后比例回到 1% 以内，占比这条硬限度恢复。
 BACKEND_LOGPROB_GAP_ONE = 1.0
 BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN = 0.003    # 0.3%，只提示
 BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT = 0.01    # 1%
@@ -183,40 +186,80 @@ def _gap_mismatch_message(gap_metrics):
     return message
 
 
-def backend_log_probability_gap_is_hard_failure(gap_metrics):
-    """差超过 1 的比例 > 1%，或最大差 > 5，或中位数 > 0.05。"""
+def above_one_fraction_is_hard_limit(model, routing_replay):
+    """占比超过 1% 要不要中止。
+
+    普通模型，以及打开了 routing_replay 的 MoE，要中止。
+    MoE 不重放时两端选的专家不同，这个占比本来就会到百分之几，不拿它中止。
+    """
+    if routing_replay:
+        return True
+    from grpx.routing_replay import find_router_modules
+    return not find_router_modules(model)
+
+
+def backend_log_probability_gap_is_hard_failure(gap_metrics, *, above_one_is_hard=True):
+    """最大差 > 5，或中位数 > 0.05；占比 > 1% 只在 above_one_is_hard 时算。"""
     above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
     gap_max = gap_metrics.get("backend_log_probability_gap_max")
     median = gap_metrics.get("backend_log_probability_gap_median")
+    above_fails = (
+        above_one_is_hard
+        and above is not None
+        and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT
+    )
     return (
-        (above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT)
+        above_fails
         or (gap_max is not None and gap_max > BACKEND_LOGPROB_GAP_MAX_LIMIT)
         or (median is not None and median > BACKEND_LOGPROB_GAP_MEDIAN_LIMIT)
     )
 
 
-def backend_log_probability_gap_is_warning(gap_metrics):
-    """差超过 1 的比例 > 0.3%。硬失败时不算警告。"""
-    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+def backend_log_probability_gap_is_warning(gap_metrics, *, above_one_is_hard=True):
+    """差超过 1 的比例 > 0.3%。硬失败时不算警告。
+
+    MoE 不重放时这个比例经常超过 0.3%，不按普通模型的偶发警告来报。
+    """
+    if backend_log_probability_gap_is_hard_failure(
+            gap_metrics, above_one_is_hard=above_one_is_hard):
+        return False
+    if not above_one_is_hard:
         return False
     above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
     return above is not None and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN
 
 
-def enforce_backend_log_probability_gap(gap_metrics, *, hard=False):
+def moe_unreplayed_gap_warning(gap_metrics):
+    """MoE 不重放时占比偏高的说明。调用方已经确认没有触发中位数或最大差。"""
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
+    return (
+        f"backend_log_probability_gap_above_one_fraction={above:.2e}；"
+        "MoE 模型不重放时两端的专家选择不同，这个读数偏高是正常的。"
+        "打开 routing_replay 可以消除，vLLM 需要 0.34.0 或更新的版本。"
+    )
+
+
+def enforce_backend_log_probability_gap(gap_metrics, *, hard=False, above_one_is_hard=True):
     """硬失败看差超过 1 的比例、最大差和中位数；0.3%–1% 只警告。
 
     hard=True 用于本进程首次核对（含 --resume），与 iteration 编号无关。
     之后的轮次即使越过硬限度也只警告，避免一次采样噪声中断已经在跑的训练。
+    above_one_is_hard=False 时占比不再中止（MoE 且未重放），中位数和最大差仍有效。
     """
-    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+    if backend_log_probability_gap_is_hard_failure(
+            gap_metrics, above_one_is_hard=above_one_is_hard):
         message = _gap_mismatch_message(gap_metrics)
         if hard:
             raise RuntimeError(message)
         warnings.warn(message, stacklevel=2)
         return
-    if backend_log_probability_gap_is_warning(gap_metrics):
-        above = gap_metrics["backend_log_probability_gap_above_one_fraction"]
+    above = gap_metrics.get("backend_log_probability_gap_above_one_fraction")
+    if (not above_one_is_hard and above is not None
+            and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT):
+        warnings.warn(moe_unreplayed_gap_warning(gap_metrics), stacklevel=2)
+        return
+    if backend_log_probability_gap_is_warning(
+            gap_metrics, above_one_is_hard=above_one_is_hard):
         warnings.warn(
             f"backend_log_probability_gap_above_one_fraction={above:.2e} "
             f"超过 {BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN:g}；"
@@ -1113,7 +1156,10 @@ def train(model, tokenizer, backend, dataset, environment_factory, config, evalu
                     record["loss"] = history[-1]["loss"]
                     record.update(public_gap_metrics(gap_metrics))
                     enforce_backend_log_probability_gap(
-                        gap_metrics, hard=gap_hard_check_pending)
+                        gap_metrics,
+                        hard=gap_hard_check_pending,
+                        above_one_is_hard=above_one_fraction_is_hard_limit(
+                            replicas[0], config.routing_replay))
                     gap_hard_check_pending = False
                     if measure_shift:
                         shift_start = time.perf_counter()

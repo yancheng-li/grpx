@@ -229,6 +229,72 @@ def test_enforce_gap_above_one_warns_without_hard_fail():
         )
 
 
+def test_above_one_limit_stays_for_dense_models_and_for_replay():
+    from grpx.loop import above_one_fraction_is_hard_limit
+    dense = torch.nn.Linear(2, 2)
+    moe = torch.nn.Linear(2, 2)
+    moe.gate = torch.nn.Linear(2, 4)
+    assert above_one_fraction_is_hard_limit(dense, False) is True
+    assert above_one_fraction_is_hard_limit(moe, False) is False
+    assert above_one_fraction_is_hard_limit(moe, True) is True
+
+
+def test_moe_without_replay_warns_when_only_the_tail_is_large():
+    # 不重放的 OLMoE 第一轮：占比 3.7%，中位数 < 0.003，最大差 2.1。不是装错了模型。
+    metrics = {
+        "backend_log_probability_gap_median": 0.002,
+        "backend_log_probability_gap_p95": 0.56,
+        "backend_log_probability_gap_above_one_fraction": 0.037,
+        "backend_log_probability_gap_max": 2.14,
+    }
+    with pytest.warns(UserWarning, match="routing_replay"):
+        enforce_backend_log_probability_gap(
+            metrics, hard=True, above_one_is_hard=False)
+    with pytest.warns(UserWarning, match="0.34"):
+        enforce_backend_log_probability_gap(
+            metrics, hard=False, above_one_is_hard=False)
+
+
+def test_moe_without_replay_still_stops_on_median_and_max():
+    with pytest.raises(RuntimeError, match="不是同一个模型"):
+        enforce_backend_log_probability_gap(
+            {
+                "backend_log_probability_gap_median": 0.06,
+                "backend_log_probability_gap_p95": 0.5,
+                "backend_log_probability_gap_above_one_fraction": 0.037,
+                "backend_log_probability_gap_max": 2.14,
+            },
+            hard=True,
+            above_one_is_hard=False,
+        )
+    with pytest.raises(RuntimeError, match="不是同一个模型"):
+        enforce_backend_log_probability_gap(
+            {
+                "backend_log_probability_gap_median": 0.002,
+                "backend_log_probability_gap_p95": 0.5,
+                "backend_log_probability_gap_above_one_fraction": 0.037,
+                "backend_log_probability_gap_max": 6.0,
+            },
+            hard=True,
+            above_one_is_hard=False,
+        )
+
+
+def test_replay_on_still_stops_when_only_the_tail_is_large():
+    # 重放已打开时，占比超过 1% 仍是错位。中位数和最大差都在硬限度以内，只靠占比拦住。
+    with pytest.raises(RuntimeError, match="不是同一个模型"):
+        enforce_backend_log_probability_gap(
+            {
+                "backend_log_probability_gap_median": 0.008,
+                "backend_log_probability_gap_p95": 0.5,
+                "backend_log_probability_gap_above_one_fraction": 0.197,
+                "backend_log_probability_gap_max": 2.14,
+            },
+            hard=True,
+            above_one_is_hard=True,
+        )
+
+
 def test_enforce_gap_hard_fails_on_large_median():
     with pytest.raises(RuntimeError, match="不是同一个模型"):
         enforce_backend_log_probability_gap(

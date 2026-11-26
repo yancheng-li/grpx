@@ -427,11 +427,11 @@ def judge_first_step_ratio(max_ratio_deviation):
     return CheckResult("训推一致", "首步 ratio", PASS, detail)
 
 
-def judge_backend_log_probability_gap(gap_metrics):
+def judge_backend_log_probability_gap(gap_metrics, *, above_one_is_hard=True):
     """采样时服务端 logprob 与训练端重算之差。
 
-    硬失败：差超过 1 的比例 > 1%，或最大差 > 5，或中位数 > 0.05。
-    警告：差超过 1 的比例 > 0.3%。限度按普通模型定。
+    硬失败：差超过 1 的比例 > 1%（MoE 且未重放时除外），或最大差 > 5，或中位数 > 0.05。
+    警告：差超过 1 的比例 > 0.3%。占比的限度按普通模型定。
     """
     from grpx.loop import (
         BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT,
@@ -440,6 +440,7 @@ def judge_backend_log_probability_gap(gap_metrics):
         BACKEND_LOGPROB_GAP_MEDIAN_LIMIT,
         backend_log_probability_gap_is_hard_failure,
         backend_log_probability_gap_is_warning,
+        moe_unreplayed_gap_warning,
     )
     if not gap_metrics:
         return CheckResult(
@@ -463,7 +464,8 @@ def judge_backend_log_probability_gap(gap_metrics):
     if median is not None:
         parts.append(f"中位数 {median:.2e}")
     detail = "，".join(parts)
-    if backend_log_probability_gap_is_hard_failure(gap_metrics):
+    if backend_log_probability_gap_is_hard_failure(
+            gap_metrics, above_one_is_hard=above_one_is_hard):
         return CheckResult(
             "训推一致", "采样对数概率差", FAIL,
             f"{detail}；超过硬限度"
@@ -472,7 +474,13 @@ def judge_backend_log_probability_gap(gap_metrics):
             f" 或 中位数>{BACKEND_LOGPROB_GAP_MEDIAN_LIMIT:g}）",
             "训练端和推理端不是同一份有效模型：检查基座路径、分词器、对话模板，"
             "以及合并模型 config.json 是否仍有顶层 rope_theta（transformers 5.x 可能只写在 rope_parameters 里）")
-    if backend_log_probability_gap_is_warning(gap_metrics):
+    if (not above_one_is_hard and above is not None
+            and above > BACKEND_LOGPROB_GAP_ABOVE_ONE_LIMIT):
+        return CheckResult(
+            "训推一致", "采样对数概率差", WARNING, detail,
+            moe_unreplayed_gap_warning(gap_metrics))
+    if backend_log_probability_gap_is_warning(
+            gap_metrics, above_one_is_hard=above_one_is_hard):
         return CheckResult(
             "训推一致", "采样对数概率差", WARNING,
             f"{detail}；|Δ|>1 比例超过 {BACKEND_LOGPROB_GAP_ABOVE_ONE_WARN:g}",
@@ -1719,7 +1727,11 @@ def _check_with_model(report, model, tokenizer, backend, train_dataset, evaluati
         if use_cuda:
             peak_by_phase["更新"] = torch.cuda.max_memory_allocated(cuda_device)
         report.add(judge_first_step_ratio(history[0]["max_ratio_deviation"]))
-        report.add(judge_backend_log_probability_gap(gap_metrics))
+        from grpx.loop import above_one_fraction_is_hard_limit
+        report.add(judge_backend_log_probability_gap(
+            gap_metrics,
+            above_one_is_hard=above_one_fraction_is_hard_limit(
+                model, config.routing_replay)))
         report.add(judge_shift(
             shift, config.learning_rate,
             mixed_precision=bool(getattr(model, "grpx_mixed_precision", False))))

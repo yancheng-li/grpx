@@ -256,6 +256,21 @@ def test_backend_log_probability_gap_uses_tail():
         "backend_log_probability_gap_above_one_fraction": 1.1e-4,
         "backend_log_probability_gap_max": 1.64,
     }).status == PASS
+    # MoE 不重放：占比到百分之几只警告，中位数和最大差仍会判失败
+    moe_tail = judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 0.002,
+        "backend_log_probability_gap_p95": 0.56,
+        "backend_log_probability_gap_above_one_fraction": 0.037,
+        "backend_log_probability_gap_max": 2.14,
+    }, above_one_is_hard=False)
+    assert moe_tail.status == WARNING
+    assert "routing_replay" in moe_tail.suggestion
+    assert judge_backend_log_probability_gap({
+        "backend_log_probability_gap_median": 0.06,
+        "backend_log_probability_gap_p95": 0.5,
+        "backend_log_probability_gap_above_one_fraction": 0.037,
+        "backend_log_probability_gap_max": 2.14,
+    }, above_one_is_hard=False).status == FAIL
     # 配置错位：差超过 1 的比例到了百分之几
     failed = judge_backend_log_probability_gap({
         "backend_log_probability_gap_median": 1e-7,
